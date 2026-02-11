@@ -1,0 +1,16 @@
+⚠ Using built-in MIRAGE system prompt (template.py not found)
+================================================================================
+MedQA RAG Comparison Evaluation
+================================================================================
+Model: gpt-4o-mini
+Modes: ['direct', 'baseline', 'planning']
+Max questions: 30
+Top-K: 5
+Generate answers: True
+================================================================================
+Loading MedQA from: /mnt/data1/home/hangeol/project/Langraph/MIRAGE/benchmark.json
+✓ Loaded 1273 MedQA questions
+
+Initializing RAG Compare Graph...
+✓ Graph initialized
+Evaluating:   0%|          | 0/30 [00:00<?, ?it/s]Evaluating:   3%|▎         | 1/30 [00:26<12:52, 26.64s/it]Evaluating:   7%|▋         | 2/30 [00:55<13:03, 27.99s/it]Evaluating:  10%|█         | 3/30 [01:23<12:35, 27.96s/it]Evaluating:  13%|█▎        | 4/30 [01:51<12:07, 27.99s/it]Evaluating:  17%|█▋        | 5/30 [02:20<11:47, 28.31s/it]Evaluating:  20%|██        | 6/30 [02:42<10:29, 26.21s/it]Evaluating:  23%|██▎       | 7/30 [03:06<09:46, 25.52s/it]Evaluating:  27%|██▋       | 8/30 [03:29<09:05, 24.78s/it]Evaluating:  30%|███       | 9/30 [03:54<08:38, 24.70s/it]Evaluating:  33%|███▎      | 10/30 [04:21<08:27, 25.38s/it]Evaluating:  37%|███▋      | 11/30 [04:43<07:44, 24.45s/it]

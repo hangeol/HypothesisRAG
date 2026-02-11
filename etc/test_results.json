@@ -1,0 +1,250 @@
+{
+  "user_input": "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?",
+  "top_k": 3,
+  "timestamp": "2026-01-21T22:37:43.785287",
+  "results": {
+    "direct": {
+      "mode": "direct",
+      "user_input": "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?",
+      "plan": null,
+      "rewritten_queries": null,
+      "final_queries": [
+        "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?"
+      ],
+      "retrieved_docs": [
+        {
+          "id": "mock_0",
+          "title": "Mock Document 0",
+          "content": "This is mock content for query: A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?. Document 0 contains placeholder text for testing.",
+          "query_trace": [
+            "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?"
+          ],
+          "fused_score": 1.0
+        },
+        {
+          "id": "mock_1",
+          "title": "Mock Document 1",
+          "content": "This is mock content for query: A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?. Document 1 contains placeholder text for testing.",
+          "query_trace": [
+            "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?"
+          ],
+          "fused_score": 0.9
+        },
+        {
+          "id": "mock_2",
+          "title": "Mock Document 2",
+          "content": "This is mock content for query: A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?. Document 2 contains placeholder text for testing.",
+          "query_trace": [
+            "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?"
+          ],
+          "fused_score": 0.8
+        }
+      ],
+      "metrics": {
+        "num_queries": 1,
+        "query_lengths": [
+          162
+        ],
+        "num_retrieved_docs": 3
+      },
+      "logs": [
+        "[normalize_input] Input length: 162 chars",
+        "[route_mode] Mode: direct",
+        "[make_queries_direct] Using original query",
+        "[retrieve] Retrieved 3 docs (fused from 1 queries)",
+        "[summarize_output] Generating summary"
+      ]
+    },
+    "baseline": {
+      "mode": "baseline",
+      "user_input": "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?",
+      "plan": null,
+      "rewritten_queries": [
+        "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?",
+        "In a 45-year-old man who reports symptoms of fatigue, excessive thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues might be present?",
+        "Considering a 45-year-old male patient with symptoms like fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses should be considered?"
+      ],
+      "final_queries": [
+        "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?",
+        "In a 45-year-old man who reports symptoms of fatigue, excessive thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues might be present?",
+        "Considering a 45-year-old male patient with symptoms like fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses should be considered?"
+      ],
+      "retrieved_docs": [
+        {
+          "id": "mock_0",
+          "title": "Mock Document 0",
+          "content": "This is mock content for query: What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?. Document 0 contains placeholder text for testing.",
+          "query_trace": [
+            "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?",
+            "In a 45-year-old man who reports symptoms of fatigue, excessive thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues might be present?",
+            "Considering a 45-year-old male patient with symptoms like fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses should be considered?"
+          ],
+          "fused_score": 3.0
+        },
+        {
+          "id": "mock_1",
+          "title": "Mock Document 1",
+          "content": "This is mock content for query: What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?. Document 1 contains placeholder text for testing.",
+          "query_trace": [
+            "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?",
+            "In a 45-year-old man who reports symptoms of fatigue, excessive thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues might be present?",
+            "Considering a 45-year-old male patient with symptoms like fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses should be considered?"
+          ],
+          "fused_score": 2.7
+        },
+        {
+          "id": "mock_2",
+          "title": "Mock Document 2",
+          "content": "This is mock content for query: What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?. Document 2 contains placeholder text for testing.",
+          "query_trace": [
+            "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, with a fasting blood glucose level of 142 mg/dL?",
+            "In a 45-year-old man who reports symptoms of fatigue, excessive thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues might be present?",
+            "Considering a 45-year-old male patient with symptoms like fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses should be considered?"
+          ],
+          "fused_score": 2.4000000000000004
+        }
+      ],
+      "metrics": {
+        "num_queries": 3,
+        "query_lengths": [
+          188,
+          200,
+          193
+        ],
+        "num_retrieved_docs": 3
+      },
+      "logs": [
+        "[normalize_input] Input length: 162 chars",
+        "[route_mode] Mode: baseline",
+        "[make_queries_rewrite_baseline] Generated 3 queries",
+        "[retrieve] Retrieved 3 docs (fused from 3 queries)",
+        "[summarize_output] Generating summary"
+      ]
+    },
+    "planning": {
+      "mode": "planning",
+      "user_input": "A 45-year-old man presents with fatigue, increased thirst, and frequent urination. His fasting blood glucose is 142 mg/dL. What could be the underlying condition?",
+      "plan": {
+        "observed_features": [
+          "fatigue",
+          "increased thirst",
+          "frequent urination",
+          "fasting blood glucose 142 mg/dL"
+        ],
+        "must_check_cooccurrence": [
+          [
+            "increased thirst",
+            "frequent urination"
+          ],
+          [
+            "fatigue",
+            "increased thirst"
+          ],
+          [
+            "fatigue",
+            "frequent urination"
+          ]
+        ],
+        "need_disambiguation": [
+          "Type 1 diabetes vs Type 2 diabetes",
+          "Diabetes insipidus vs Diabetes mellitus"
+        ]
+      },
+      "rewritten_queries": [
+        "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?",
+        "In a 45-year-old man who reports symptoms of fatigue, increased thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues should be considered?",
+        "Considering a 45-year-old male patient with symptoms of fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses might explain these symptoms?"
+      ],
+      "final_queries": [
+        "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?",
+        "In a 45-year-old man who reports symptoms of fatigue, increased thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues should be considered?",
+        "Considering a 45-year-old male patient with symptoms of fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses might explain these symptoms?"
+      ],
+      "retrieved_docs": [
+        {
+          "id": "mock_0",
+          "title": "Mock Document 0",
+          "content": "This is mock content for query: What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?. Document 0 contains placeholder text for testing.",
+          "query_trace": [
+            "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?",
+            "In a 45-year-old man who reports symptoms of fatigue, increased thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues should be considered?",
+            "Considering a 45-year-old male patient with symptoms of fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses might explain these symptoms?"
+          ],
+          "fused_score": 3.0
+        },
+        {
+          "id": "mock_1",
+          "title": "Mock Document 1",
+          "content": "This is mock content for query: What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?. Document 1 contains placeholder text for testing.",
+          "query_trace": [
+            "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?",
+            "In a 45-year-old man who reports symptoms of fatigue, increased thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues should be considered?",
+            "Considering a 45-year-old male patient with symptoms of fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses might explain these symptoms?"
+          ],
+          "fused_score": 2.7
+        },
+        {
+          "id": "mock_2",
+          "title": "Mock Document 2",
+          "content": "This is mock content for query: What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?. Document 2 contains placeholder text for testing.",
+          "query_trace": [
+            "What are the possible medical conditions associated with a 45-year-old male experiencing fatigue, increased thirst, and frequent urination, particularly with a fasting blood glucose level of 142 mg/dL?",
+            "In a 45-year-old man who reports symptoms of fatigue, increased thirst, and frequent urination, along with a fasting blood glucose reading of 142 mg/dL, what underlying health issues should be considered?",
+            "Considering a 45-year-old male patient with symptoms of fatigue, increased thirst, and frequent urination, and a fasting blood glucose level of 142 mg/dL, what diagnoses might explain these symptoms?"
+          ],
+          "fused_score": 2.4000000000000004
+        }
+      ],
+      "metrics": {
+        "num_queries": 3,
+        "query_lengths": [
+          201,
+          204,
+          199
+        ],
+        "num_retrieved_docs": 3,
+        "features_in_queries": {
+          "fatigue": true,
+          "increased thirst": true,
+          "frequent urination": true,
+          "fasting blood glucose 142 mg/dL": false
+        },
+        "feature_coverage": 0.75,
+        "cooccurrence_coverage": [
+          {
+            "pair": [
+              "increased thirst",
+              "frequent urination"
+            ],
+            "docs_with_both": 3,
+            "ratio": 1.0
+          },
+          {
+            "pair": [
+              "fatigue",
+              "increased thirst"
+            ],
+            "docs_with_both": 3,
+            "ratio": 1.0
+          },
+          {
+            "pair": [
+              "fatigue",
+              "frequent urination"
+            ],
+            "docs_with_both": 3,
+            "ratio": 1.0
+          }
+        ]
+      },
+      "logs": [
+        "[normalize_input] Input length: 162 chars",
+        "[route_mode] Mode: planning",
+        "[make_plan] Extracted 4 features",
+        "[make_queries_rewrite_planning] Generated 3 queries with plan",
+        "[retrieve] Retrieved 3 docs (fused from 3 queries)",
+        "[summarize_output] Generating summary"
+      ]
+    }
+  }
+}
