@@ -467,6 +467,106 @@ class AsyncOpenAIClient:
 
 
 # ============================================================================
+# Async vLLM Client
+# ============================================================================
+class VLLMAsyncClient:
+    """Async wrapper around local vLLM inference (matching MedRAG pattern)"""
+
+    def __init__(
+        self,
+        model: str,
+        max_concurrent: int = 1,
+        max_retries: int = 2,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_tokens: int = 4096,
+        max_model_len: int = 8192,
+        trust_remote_code: bool = True,
+    ):
+        self.model = model
+        self.max_retries = max_retries
+        self.max_tokens = max_tokens
+        # vLLM offline LLM is NOT thread-safe; serialize all calls
+        self.semaphore = asyncio.Semaphore(1)
+
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError as e:
+            raise ImportError(
+                "vLLM backend selected but `vllm` is not installed. "
+                "Install it with: pip install vllm"
+            ) from e
+
+        self._SamplingParams = SamplingParams
+        print(f"Initializing vLLM for {model} (tp={tensor_parallel_size}, "
+              f"max_model_len={max_model_len}, gpu_mem={gpu_memory_utilization})")
+        self._llm = LLM(
+            model=model,
+            dtype="bfloat16",
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            trust_remote_code=trust_remote_code,
+        )
+        self._sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            stop=["###", "User:", "\n\n\n"],
+        )
+        self._tokenizer = self._llm.get_tokenizer()
+
+    def _format_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """Convert chat messages into a model prompt for vLLM"""
+        try:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            lines = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                lines.append(f"{role}: {content}")
+            lines.append("assistant:")
+            return "\n".join(lines)
+
+    def _generate_sync(self, messages: List[Dict[str, str]], temperature: float) -> str:
+        prompt = self._format_prompt(messages)
+        if temperature != 0.0:
+            sampling_params = self._SamplingParams(
+                temperature=temperature,
+                max_tokens=self.max_tokens,
+                stop=["###", "User:", "\n\n\n"],
+            )
+        else:
+            sampling_params = self._sampling_params
+        outputs = self._llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
+        if not outputs or not outputs[0].outputs:
+            return ""
+        return outputs[0].outputs[0].text
+
+    async def chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0,
+        session: aiohttp.ClientSession = None,
+    ) -> str:
+        """Generate text using local vLLM (session kept for API compatibility)"""
+        del session
+        async with self.semaphore:
+            for attempt in range(self.max_retries):
+                try:
+                    return await asyncio.to_thread(self._generate_sync, messages, temperature)
+                except Exception as e:
+                    if attempt == self.max_retries - 1:
+                        return f"Error: {str(e)}"
+                    await asyncio.sleep(1)
+        return "Error: Max retries exceeded"
+
+
+# ============================================================================
 # Async RAG Evaluator
 # ============================================================================
 class AsyncRAGEvaluator:
@@ -474,6 +574,7 @@ class AsyncRAGEvaluator:
     
     def __init__(
         self,
+        llm_provider: str = "openai",
         model_name: str = "gpt-4o-mini",
         retriever_name: str = "MedCPT",
         corpus_name: str = "Textbooks",
@@ -482,7 +583,13 @@ class AsyncRAGEvaluator:
         num_subqueries: int = 5,
         docs_per_query_direct: int = 25,
         docs_per_query_multi: int = 5,
+        vllm_tensor_parallel_size: int = 1,
+        vllm_gpu_memory_utilization: float = 0.9,
+        vllm_max_tokens: int = 4096,
+        vllm_max_concurrent: int = 1,
+        vllm_max_model_len: int = 8192,
     ):
+        self.llm_provider = llm_provider.lower()
         self.model_name = model_name
         self.num_subqueries = num_subqueries
         self.docs_per_query_direct = docs_per_query_direct
@@ -490,13 +597,25 @@ class AsyncRAGEvaluator:
         self.max_concurrent = max_concurrent
         
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        
-        # Async OpenAI client
-        self.client = AsyncOpenAIClient(
-            api_key=self.api_key,
-            model=model_name,
-            max_concurrent=max_concurrent,
-        )
+
+        # Async LLM client (OpenAI or local vLLM)
+        if self.llm_provider == "openai":
+            self.client = AsyncOpenAIClient(
+                api_key=self.api_key,
+                model=model_name,
+                max_concurrent=max_concurrent,
+            )
+        elif self.llm_provider == "vllm":
+            self.client = VLLMAsyncClient(
+                model=model_name,
+                max_concurrent=vllm_max_concurrent,
+                tensor_parallel_size=vllm_tensor_parallel_size,
+                gpu_memory_utilization=vllm_gpu_memory_utilization,
+                max_tokens=vllm_max_tokens,
+                max_model_len=vllm_max_model_len,
+            )
+        else:
+            raise ValueError(f"Unsupported llm_provider: {llm_provider}")
         
         # Initialize retriever (sync, but fast)
         self.retriever = create_retriever(
@@ -570,7 +689,16 @@ class AsyncRAGEvaluator:
             features = plan.get("observed_features", [])
             cooccurrence = plan.get("must_check_cooccurrence", [])
             features_str = ", ".join(features[:5]) if features else "N/A"
-            cooccurrence_str = " & ".join([f"({a}&{b})" for a, b in cooccurrence[:2]]) if cooccurrence else ""
+            cooccurrence_pairs = []
+            for item in cooccurrence[:2]:
+                if isinstance(item, (list, tuple)):
+                    if len(item) >= 2:
+                        cooccurrence_pairs.append(f"({item[0]}&{item[1]})")
+                    elif len(item) == 1:
+                        cooccurrence_pairs.append(f"({item[0]})")
+                else:
+                    cooccurrence_pairs.append(f"({item})")
+            cooccurrence_str = " & ".join(cooccurrence_pairs) if cooccurrence_pairs else ""
             plan_summary = f"Key features: {features_str}"
             if cooccurrence_str:
                 plan_summary += f" | Must-check: {cooccurrence_str}"
@@ -1457,12 +1585,18 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
 
 async def run_evaluation_async(
     max_questions: int = 100,
+    llm_provider: str = "openai",
     model_name: str = "gpt-4o-mini",
     retriever_name: str = "MedCPT",
     corpus_name: str = "Textbooks",
     max_concurrent: int = 100,
     output_dir: str = "results",
     modes: List[str] = None,
+    vllm_tensor_parallel_size: int = 1,
+    vllm_gpu_memory_utilization: float = 0.9,
+    vllm_max_tokens: int = 4096,
+    vllm_max_concurrent: int = 1,
+    vllm_max_model_len: int = 8192,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     
@@ -1475,10 +1609,13 @@ async def run_evaluation_async(
     print("=" * 80)
     print("MedQA Evaluation (MAX ASYNC)")
     print("=" * 80)
+    print(f"LLM provider: {llm_provider}")
     print(f"Model: {model_name}")
     print(f"Modes: {modes}")
     print(f"Max questions: {max_questions}")
     print(f"Max concurrent requests: {max_concurrent}")
+    if llm_provider == "vllm":
+        print(f"vLLM settings: tp={vllm_tensor_parallel_size}, gpu_mem={vllm_gpu_memory_utilization}, max_model_len={vllm_max_model_len}, max_tokens={vllm_max_tokens}")
     
     if "cot" in modes:
         print(f"CoT: No retrieval (Chain-of-Thought only)")
@@ -1496,10 +1633,16 @@ async def run_evaluation_async(
     
     # Initialize evaluator
     evaluator = AsyncRAGEvaluator(
+        llm_provider=llm_provider,
         model_name=model_name,
         retriever_name=retriever_name,
         corpus_name=corpus_name,
         max_concurrent=max_concurrent,
+        vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        vllm_max_tokens=vllm_max_tokens,
+        vllm_max_concurrent=vllm_max_concurrent,
+        vllm_max_model_len=vllm_max_model_len,
     )
     
     results = []
@@ -1572,6 +1715,7 @@ async def run_evaluation_async(
     # Build summary
     summary = {
         "config": {
+            "llm_provider": llm_provider,
             "model_name": model_name,
             "modes": modes,
             "retriever_name": retriever_name if rag_modes else None,
@@ -1579,6 +1723,11 @@ async def run_evaluation_async(
             "max_questions": max_questions,
             "total_evaluated": len(results),
             "max_concurrent": max_concurrent,
+            "vllm_tensor_parallel_size": vllm_tensor_parallel_size if llm_provider == "vllm" else None,
+            "vllm_gpu_memory_utilization": vllm_gpu_memory_utilization if llm_provider == "vllm" else None,
+            "vllm_max_tokens": vllm_max_tokens if llm_provider == "vllm" else None,
+            "vllm_max_concurrent": vllm_max_concurrent if llm_provider == "vllm" else None,
+            "vllm_max_model_len": vllm_max_model_len if llm_provider == "vllm" else None,
         },
         "timing": {
             "total_seconds": total_time,
@@ -1630,7 +1779,10 @@ async def run_evaluation_async(
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_suffix = "_".join(modes)
-    output_file = os.path.join(output_dir, f"medqa_{mode_suffix}_{timestamp}.json")
+    model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
+    if not model_suffix:
+        model_suffix = "model"
+    output_file = os.path.join(output_dir, f"medqa_{mode_suffix}_{model_suffix}_{timestamp}.json")
     
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
@@ -1666,6 +1818,8 @@ Examples:
     parser.add_argument('--max-questions', '-n', type=int, default=2000)
     parser.add_argument('--max-concurrent', '-c', type=int, default=100,
                        help='Max concurrent API requests (default: 100)')
+    parser.add_argument('--llm-provider', type=str, default='openai', choices=['openai', 'vllm'],
+                       help='LLM backend provider: openai API or local vLLM')
     parser.add_argument('--modes', '-m', nargs='+', 
                        choices=['cot', 'direct', 'baseline', 'planning', 'planning_v2', 'planning_v3', 'planning_v4', 'planning_v5', 'planning_v6'],
                        default=['direct', 'baseline', 'planning'],
@@ -1674,18 +1828,31 @@ Examples:
     parser.add_argument('--retriever', type=str, default='MedCPT')
     parser.add_argument('--corpus', type=str, default='Textbooks')
     parser.add_argument('--output-dir', '-o', type=str, default='results')
+    parser.add_argument('--vllm-tensor-parallel-size', type=int, default=1)
+    parser.add_argument('--vllm-gpu-memory-utilization', type=float, default=0.9)
+    parser.add_argument('--vllm-max-tokens', type=int, default=4096)
+    parser.add_argument('--vllm-max-concurrent', type=int, default=1,
+                       help='Concurrent local generations when using vLLM backend (keep 1 for stability)')
+    parser.add_argument('--vllm-max-model-len', type=int, default=8192,
+                       help='Maximum model context length for vLLM (default: 8192)')
     
     args = parser.parse_args()
     
     # Run async evaluation
     asyncio.run(run_evaluation_async(
         max_questions=args.max_questions,
+        llm_provider=args.llm_provider,
         model_name=args.model,
         retriever_name=args.retriever,
         corpus_name=args.corpus,
         max_concurrent=args.max_concurrent,
         output_dir=args.output_dir,
         modes=args.modes,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_tokens=args.vllm_max_tokens,
+        vllm_max_concurrent=args.vllm_max_concurrent,
+        vllm_max_model_len=args.vllm_max_model_len,
     ))
 
 
