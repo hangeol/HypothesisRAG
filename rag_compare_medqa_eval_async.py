@@ -7,9 +7,10 @@ with maximum async parallel execution for fastest processing.
 
 Evaluation Modes:
 - cot: Chain-of-Thought baseline (no RAG, just LLM reasoning)
-- direct: 1 query × 25 documents = 25 documents total
-- baseline: 5 queries × 5 documents = 25 documents total  
-- planning: 5 queries × 5 documents = 25 documents total
+- direct: 1 query × total_docs documents
+- baseline: 5 queries × (total_docs/5) documents per query
+- planning_v4: 3 queries × (total_docs/3) documents per query
+All RAG modes retrieve the same total number of documents (default: 15)
 """
 
 import os
@@ -581,8 +582,7 @@ class AsyncRAGEvaluator:
         api_key: Optional[str] = None,
         max_concurrent: int = 100,
         num_subqueries: int = 5,
-        docs_per_query_direct: int = 25,
-        docs_per_query_multi: int = 5,
+        total_docs: int = 15,
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.9,
         vllm_max_tokens: int = 4096,
@@ -592,8 +592,7 @@ class AsyncRAGEvaluator:
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
         self.num_subqueries = num_subqueries
-        self.docs_per_query_direct = docs_per_query_direct
-        self.docs_per_query_multi = docs_per_query_multi
+        self.total_docs = total_docs
         self.max_concurrent = max_concurrent
         
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -1251,6 +1250,9 @@ Question:
 Options:
 {options_text}
 
+Initial Analysis Plan:
+{plan_text}
+
 Generated subqueries from the initial analysis:
 {queries_text}
 
@@ -1465,22 +1467,31 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 planning_v5_docs = []
                 planning_v6_docs = []
                 
+                # Each mode retrieves total_docs documents (budget split across queries)
+                T = self.total_docs
                 if "direct" in rag_modes:
-                    direct_docs = self.retrieve_documents([question], self.docs_per_query_direct)
+                    direct_docs = self.retrieve_documents([question], T)
                 if "baseline" in rag_modes and baseline_queries:
-                    baseline_docs = self.retrieve_documents(baseline_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(baseline_queries))
+                    baseline_docs = self.retrieve_documents(baseline_queries, k)
                 if "planning" in rag_modes and planning_queries:
-                    planning_docs = self.retrieve_documents(planning_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(planning_queries))
+                    planning_docs = self.retrieve_documents(planning_queries, k)
                 if "planning_v2" in rag_modes and planning_v2_queries:
-                    planning_v2_docs = self.retrieve_documents(planning_v2_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(planning_v2_queries))
+                    planning_v2_docs = self.retrieve_documents(planning_v2_queries, k)
                 if "planning_v3" in rag_modes and planning_v3_queries:
-                    planning_v3_docs = self.retrieve_documents(planning_v3_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(planning_v3_queries))
+                    planning_v3_docs = self.retrieve_documents(planning_v3_queries, k)
                 if "planning_v4" in rag_modes and planning_v4_queries:
-                    planning_v4_docs = self.retrieve_documents(planning_v4_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(planning_v4_queries))
+                    planning_v4_docs = self.retrieve_documents(planning_v4_queries, k)
                 if "planning_v5" in rag_modes and planning_v5_queries:
-                    planning_v5_docs = self.retrieve_documents(planning_v5_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(planning_v5_queries))
+                    planning_v5_docs = self.retrieve_documents(planning_v5_queries, k)
                 if "planning_v6" in rag_modes and planning_v6_queries:
-                    planning_v6_docs = self.retrieve_documents(planning_v6_queries, self.docs_per_query_multi)
+                    k = max(1, T // len(planning_v6_queries))
+                    planning_v6_docs = self.retrieve_documents(planning_v6_queries, k)
                 
                 # Step 4: Generate all answers in parallel
                 answer_tasks = []
@@ -1597,6 +1608,7 @@ async def run_evaluation_async(
     vllm_max_tokens: int = 4096,
     vllm_max_concurrent: int = 1,
     vllm_max_model_len: int = 8192,
+    total_docs: int = 15,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     
@@ -1622,7 +1634,7 @@ async def run_evaluation_async(
     
     rag_modes = [m for m in modes if m != "cot"]
     if rag_modes:
-        print(f"RAG: direct=25 docs, baseline/planning=5x5 docs")
+        print(f"RAG: total_docs=15 per mode (budget split across queries)")
         print(f"Retriever: {retriever_name} | Corpus: {corpus_name}")
     
     print("=" * 80)
@@ -1638,6 +1650,7 @@ async def run_evaluation_async(
         retriever_name=retriever_name,
         corpus_name=corpus_name,
         max_concurrent=max_concurrent,
+        total_docs=total_docs,
         vllm_tensor_parallel_size=vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_max_tokens=vllm_max_tokens,
@@ -1728,6 +1741,7 @@ async def run_evaluation_async(
             "vllm_max_tokens": vllm_max_tokens if llm_provider == "vllm" else None,
             "vllm_max_concurrent": vllm_max_concurrent if llm_provider == "vllm" else None,
             "vllm_max_model_len": vllm_max_model_len if llm_provider == "vllm" else None,
+            "total_docs": total_docs,
         },
         "timing": {
             "total_seconds": total_time,
@@ -1835,6 +1849,8 @@ Examples:
                        help='Concurrent local generations when using vLLM backend (keep 1 for stability)')
     parser.add_argument('--vllm-max-model-len', type=int, default=8192,
                        help='Maximum model context length for vLLM (default: 8192)')
+    parser.add_argument('--total-docs', type=int, default=15,
+                       help='Total documents to retrieve per RAG mode (default: 15)')
     
     args = parser.parse_args()
     
@@ -1853,6 +1869,7 @@ Examples:
         vllm_max_tokens=args.vllm_max_tokens,
         vllm_max_concurrent=args.vllm_max_concurrent,
         vllm_max_model_len=args.vllm_max_model_len,
+        total_docs=args.total_docs,
     ))
 
 
