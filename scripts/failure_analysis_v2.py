@@ -24,6 +24,7 @@ import json
 import os
 import random
 import re
+import datetime
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -886,7 +887,7 @@ def build_sets(direct: Dict[str, Any], cot: Dict[str, Any]) -> Tuple[List[Tuple[
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--direct", type=Path, required=True)
-    p.add_argument("--cot", type=Path, required=True)
+    p.add_argument("--target", type=Path, required=True)
     p.add_argument("--out_dir", type=Path, required=True)
 
     # controls
@@ -908,8 +909,47 @@ async def async_main():
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    # valid path check
+    if not args.direct.exists():
+         raise FileNotFoundError(f"Direct file not found: {args.direct}")
+    if not args.target.exists():
+         raise FileNotFoundError(f"Target file not found: {args.target}")
+
+    # Create timestamped subdirectory
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_out_dir = args.out_dir / f"run_{timestamp}"
+    new_out_dir.mkdir(parents=True, exist_ok=True)
+    args.out_dir = new_out_dir
+    
+    # Write input info
+    info_path = new_out_dir / "input_info.txt"
+    info_content = f"""Timestamp: {timestamp}
+Direct File: {args.direct.resolve()}
+Target File: {args.target.resolve()}
+"""
+    info_path.write_text(info_content, encoding="utf-8")
+
     direct = load_json_file(args.direct)
-    cot = load_json_file(args.cot)
+    cot = load_json_file(args.target)
+
+    # Normalize mode keys to 'direct' and 'cot' to match internal logic
+    def normalize_mode_label(data: Dict[str, Any], target_label: str) -> None:
+        mapped = 0
+        for item in data.values():
+            if not isinstance(item, dict): continue
+            modes = item.get("modes", {})
+            if target_label in modes:
+                continue
+            keys = list(modes.keys())
+            if len(keys) == 1:
+                original = keys[0]
+                modes[target_label] = modes.pop(original)
+                mapped += 1
+        if mapped > 0:
+            print(f"Normalized {mapped} items: renamed mode to '{target_label}'")
+
+    normalize_mode_label(direct, "direct")
+    normalize_mode_label(cot, "cot")
 
     set1, set2, skipped = build_sets(direct, cot)
     print(f"SET1={len(set1)} SET2={len(set2)} skipped={skipped}")
