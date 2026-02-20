@@ -1,41 +1,0 @@
-⚠ Using built-in MIRAGE prompts
-================================================================================
-MedQA Evaluation (MAX ASYNC)
-================================================================================
-Model: gpt-4o-mini
-Modes: ['planning_v4', 'planning_v5']
-Max questions: 30
-Max concurrent requests: 30
-RAG: direct=25 docs, baseline/planning=5x5 docs
-Retriever: MedCPT | Corpus: Textbooks
-================================================================================
-✓ Loaded 1273 MedQA questions
-
-Processing 30 questions with 30 concurrent requests...
-Started at: 2026-01-23 15:15:44
-Estimated API calls: ~0
-================================================================================
-Evaluating:   0%|          | 0/30 [00:00<?, ?it/s]No sentence-transformers model found with name ncbi/MedCPT-Query-Encoder. Creating a new one with CLS pooling.
-Initializing the document extracter...
-Initialization finished!
-✓ MIRAGE retriever initialized: MedCPT on Textbooks
-Evaluating:   3%|▎         | 1/30 [00:23<11:17, 23.36s/it]Evaluating:   7%|▋         | 2/30 [00:23<04:34,  9.79s/it]Evaluating:  10%|█         | 3/30 [00:24<02:38,  5.87s/it]Evaluating:  17%|█▋        | 5/30 [00:25<01:08,  2.75s/it]Evaluating:  20%|██        | 6/30 [00:25<00:48,  2.03s/it]Evaluating:  23%|██▎       | 7/30 [00:26<00:35,  1.53s/it]Evaluating:  27%|██▋       | 8/30 [00:26<00:27,  1.25s/it]Evaluating:  30%|███       | 9/30 [00:26<00:20,  1.05it/s]Evaluating:  33%|███▎      | 10/30 [00:27<00:15,  1.31it/s]Evaluating:  37%|███▋      | 11/30 [00:27<00:12,  1.54it/s]Evaluating:  43%|████▎     | 13/30 [00:28<00:07,  2.24it/s]Evaluating:  47%|████▋     | 14/30 [00:28<00:05,  2.68it/s]Evaluating:  53%|█████▎    | 16/30 [00:28<00:05,  2.77it/s]Evaluating:  60%|██████    | 18/30 [00:29<00:03,  3.81it/s]Evaluating:  63%|██████▎   | 19/30 [00:29<00:02,  4.07it/s]Evaluating:  67%|██████▋   | 20/30 [00:29<00:03,  3.33it/s]Evaluating:  70%|███████   | 21/30 [00:30<00:02,  3.15it/s]Evaluating:  73%|███████▎  | 22/30 [00:30<00:02,  3.55it/s]Evaluating:  77%|███████▋  | 23/30 [00:30<00:02,  2.86it/s]Evaluating:  83%|████████▎ | 25/30 [00:30<00:01,  4.50it/s]Evaluating:  90%|█████████ | 27/30 [00:31<00:00,  4.61it/s]Evaluating:  93%|█████████▎| 28/30 [00:31<00:00,  4.31it/s]Evaluating: 100%|██████████| 30/30 [00:32<00:00,  4.37it/s]Evaluating: 100%|██████████| 30/30 [00:32<00:00,  1.07s/it]
-
-================================================================================
-FINAL RESULTS
-================================================================================
-Total questions: 30
-Total time: 0.5 minutes (32 seconds)
-Speed: 56.0 questions/minute
-
-Accuracy by Mode:
-----------------------------------------
-  planning_v4 :   24/  30 (80.0%)
-  planning_v5 :   24/  30 (80.0%)
-
-Comparison vs planning_v4:
-----------------------------------------
-  planning_v5 : +0.0%
-================================================================================
-
-✓ Results saved to: results/medqa_planning_v4_planning_v5_20260123_151616.json

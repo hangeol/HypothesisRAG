@@ -8,8 +8,8 @@ CLI tool for running 3-way RAG comparison experiments:
 - planning_rewrite_rag: Planning-based query rewriting
 
 Usage:
-    python -m rag_compare_runner --mode direct --input "..."
-    python -m rag_compare_runner --input_file data.jsonl --batch
+    python -m run_rag --mode direct --input "..."
+    python -m run_rag --input_file data.jsonl --batch
 """
 
 import os
@@ -20,9 +20,10 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 # Add current directory to path
+# Add current directory to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from rag_compare_graph import create_rag_compare_graph, RAGCompareGraph
+from rag_core import create_rag_compare_graph, RAGCompareGraph
 
 
 def run_single(

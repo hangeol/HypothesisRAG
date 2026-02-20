@@ -27,9 +27,30 @@ from tqdm import tqdm
 import aiohttp
 
 # Add current directory to path
+# Add current directory to path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from retriever import create_retriever
+
+
+RETRIEVAL_DATASET_TO_CORPUS = {
+    "textbooks": "Textbooks",
+    "pubmed": "PubMed",
+}
+CORPUS_TO_RETRIEVAL_DATASET = {
+    corpus.lower(): dataset for dataset, corpus in RETRIEVAL_DATASET_TO_CORPUS.items()
+}
+
+
+def parse_retrieval_dataset(value: str) -> str:
+    """Normalize retrieval dataset input to canonical MIRAGE corpus name."""
+    normalized = value.strip().lower()
+    if normalized not in RETRIEVAL_DATASET_TO_CORPUS:
+        allowed = ", ".join(sorted(RETRIEVAL_DATASET_TO_CORPUS.keys()))
+        raise argparse.ArgumentTypeError(
+            f"Invalid retrieval dataset '{value}'. Choose one of: {allowed}"
+        )
+    return RETRIEVAL_DATASET_TO_CORPUS[normalized]
 
 # ============================================================================
 # Prompts from MIRAGE template.py
@@ -588,6 +609,8 @@ class AsyncRAGEvaluator:
         vllm_max_tokens: int = 4096,
         vllm_max_concurrent: int = 1,
         vllm_max_model_len: int = 8192,
+        rewriter_adapter_path: Optional[str] = None,
+        rewriter_base_model: Optional[str] = None,
     ):
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
@@ -615,6 +638,31 @@ class AsyncRAGEvaluator:
             )
         else:
             raise ValueError(f"Unsupported llm_provider: {llm_provider}")
+
+        # GRPO-trained rewriter adapter (optional, for planning_v4_grpo mode)
+        self.grpo_rewriter_model = None
+        self.grpo_rewriter_tokenizer = None
+        if rewriter_adapter_path:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from peft import PeftModel
+
+            base_name = rewriter_base_model or model_name
+            print(f"Loading GRPO rewriter adapter from {rewriter_adapter_path}...")
+            self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
+                base_name, trust_remote_code=True
+            )
+            if self.grpo_rewriter_tokenizer.pad_token is None:
+                self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_name, torch_dtype=torch.bfloat16,
+                device_map="auto", trust_remote_code=True,
+            )
+            self.grpo_rewriter_model = PeftModel.from_pretrained(
+                base_model, rewriter_adapter_path
+            )
+            self.grpo_rewriter_model.eval()
+            print(f"✓ GRPO rewriter adapter loaded (base: {base_name})")
         
         # Initialize retriever (sync, but fast)
         self.retriever = create_retriever(
@@ -1020,6 +1068,65 @@ class AsyncRAGEvaluator:
         return queries[:5]  # Cap at 5
     
     # =========================================================================
+    # Planning V4 + GRPO: Trained Rewriter Adapter
+    # =========================================================================
+    def generate_queries_grpo_rewriter(
+        self,
+        question: str,
+        options: Dict[str, str],
+        plan: Dict[str, Any],
+    ) -> List[str]:
+        """Generate queries using the GRPO-trained rewriter (HF model w/ LoRA).
+        
+        Synchronous method — runs the HF model with LoRA adapter.
+        Call via asyncio.loop.run_in_executor() when inside an async context.
+        """
+        if self.grpo_rewriter_model is None:
+            raise RuntimeError("GRPO rewriter not loaded. Use --rewriter-adapter-path.")
+        
+        import torch
+        from data.medqa_loader import format_rewriter_prompt
+        from training.reward import parse_queries_from_completion
+        
+        messages = format_rewriter_prompt(question, options, plan)
+        try:
+            prompt_text = self.grpo_rewriter_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            prompt_text = f"system: {messages[0]['content']}\nuser: {messages[1]['content']}\nassistant:"
+        
+        inputs = self.grpo_rewriter_tokenizer(
+            prompt_text, return_tensors="pt"
+        ).to(self.grpo_rewriter_model.device)
+        
+        with torch.no_grad():
+            outputs = self.grpo_rewriter_model.generate(
+                **inputs, max_new_tokens=256,
+                temperature=1.0, do_sample=False,
+            )
+        
+        completion_ids = outputs[0][inputs["input_ids"].shape[1]:]
+        completion_text = self.grpo_rewriter_tokenizer.decode(
+            completion_ids, skip_special_tokens=True
+        )
+        
+        queries = parse_queries_from_completion(completion_text)
+        
+        # Fallback if parsing fails
+        if len(queries) < 2:
+            best_guess = plan.get("best_guess", "")
+            confirming_evidence = ", ".join(plan.get("confirming_evidence", [])[:3])
+            discriminating_features = ", ".join(plan.get("discriminating_features", [])[:3])
+            queries = [
+                f"{best_guess} {discriminating_features}",
+                f"{confirming_evidence}",
+                f"{plan.get('reasoning', '')} diagnosis",
+            ]
+        
+        return queries[:5]
+    
+    # =========================================================================
     # Planning V6: Dual Hypothesis Testing
     # =========================================================================
     async def generate_plan_v6_async(
@@ -1348,7 +1455,7 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 }
             
             # Handle RAG modes (including planning_v2, planning_v3, planning_v4, planning_v5, planning_v6)
-            rag_modes = [m for m in modes if m in ["direct", "baseline", "planning", "planning_v2", "planning_v3", "planning_v4", "planning_v5", "planning_v6"]]
+            rag_modes = [m for m in modes if m in ["direct", "baseline", "planning", "planning_v2", "planning_v3", "planning_v4", "planning_v4_grpo", "planning_v5", "planning_v6"]]
             
             if rag_modes:
                 # Step 1: Generate plans and baseline queries in parallel
@@ -1359,6 +1466,7 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 need_plan_v2 = "planning_v2" in rag_modes
                 need_plan_v3 = "planning_v3" in rag_modes
                 need_plan_v4 = "planning_v4" in rag_modes
+                need_plan_v4_grpo = "planning_v4_grpo" in rag_modes
                 need_plan_v5 = "planning_v5" in rag_modes
                 need_plan_v6 = "planning_v6" in rag_modes
                 need_baseline_queries = "baseline" in rag_modes
@@ -1375,6 +1483,9 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 if need_plan_v4:
                     tasks.append(self.generate_plan_v4_async(question, options, session))
                     task_names.append("plan_v4")
+                if need_plan_v4_grpo:
+                    tasks.append(self.generate_plan_v4_async(question, options, session))
+                    task_names.append("plan_v4_grpo")
                 if need_plan_v5:
                     # V5 uses same plan as V4
                     tasks.append(self.generate_plan_v4_async(question, options, session))
@@ -1392,6 +1503,7 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 plan_v2 = None
                 plan_v3 = None
                 plan_v4 = None
+                plan_v4_grpo = None
                 plan_v5 = None
                 plan_v6 = None
                 baseline_queries = None
@@ -1404,6 +1516,8 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                         plan_v3 = gathered[i]
                     elif name == "plan_v4":
                         plan_v4 = gathered[i]
+                    elif name == "plan_v4_grpo":
+                        plan_v4_grpo = gathered[i]
                     elif name == "plan_v5":
                         plan_v5 = gathered[i]
                     elif name == "plan_v6":
@@ -1416,6 +1530,7 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 planning_v2_queries = None
                 planning_v3_queries = None
                 planning_v4_queries = None
+                planning_v4_grpo_queries = None
                 planning_v5_queries = None
                 planning_v6_queries = None
                 
@@ -1434,6 +1549,12 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 if "planning_v4" in rag_modes and plan_v4:
                     query_tasks.append(self.generate_queries_from_plan_v4_async(question, plan_v4, session))
                     query_task_names.append("planning_v4_queries")
+                if "planning_v4_grpo" in rag_modes and plan_v4_grpo:
+                    # GRPO rewriter is sync (HF model), run in executor to avoid blocking
+                    loop = asyncio.get_event_loop()
+                    planning_v4_grpo_queries = await loop.run_in_executor(
+                        None, self.generate_queries_grpo_rewriter, question, options, plan_v4_grpo
+                    )
                 if "planning_v5" in rag_modes and plan_v5:
                     # V5 uses same query generation as V4
                     query_tasks.append(self.generate_queries_from_plan_v4_async(question, plan_v5, session))
@@ -1452,6 +1573,8 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                         planning_v3_queries = query_gathered[i]
                     elif name == "planning_v4_queries":
                         planning_v4_queries = query_gathered[i]
+                    elif name == "planning_v4_grpo_queries":
+                        planning_v4_grpo_queries = query_gathered[i]
                     elif name == "planning_v5_queries":
                         planning_v5_queries = query_gathered[i]
                     elif name == "planning_v6_queries":
@@ -1464,6 +1587,7 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 planning_v2_docs = []
                 planning_v3_docs = []
                 planning_v4_docs = []
+                planning_v4_grpo_docs = []
                 planning_v5_docs = []
                 planning_v6_docs = []
                 
@@ -1486,6 +1610,9 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 if "planning_v4" in rag_modes and planning_v4_queries:
                     k = max(1, T // len(planning_v4_queries))
                     planning_v4_docs = self.retrieve_documents(planning_v4_queries, k)
+                if "planning_v4_grpo" in rag_modes and planning_v4_grpo_queries:
+                    k = max(1, T // len(planning_v4_grpo_queries))
+                    planning_v4_grpo_docs = self.retrieve_documents(planning_v4_grpo_queries, k)
                 if "planning_v5" in rag_modes and planning_v5_queries:
                     k = max(1, T // len(planning_v5_queries))
                     planning_v5_docs = self.retrieve_documents(planning_v5_queries, k)
@@ -1515,6 +1642,9 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                 if "planning_v4" in rag_modes and planning_v4_queries:
                     answer_tasks.append(self.generate_answer_async(question, options, planning_v4_docs, session))
                     answer_mode_order.append("planning_v4")
+                if "planning_v4_grpo" in rag_modes and planning_v4_grpo_queries:
+                    answer_tasks.append(self.generate_answer_async(question, options, planning_v4_grpo_docs, session))
+                    answer_mode_order.append("planning_v4_grpo")
                 if "planning_v5" in rag_modes and planning_v5_queries:
                     # V5 uses the new method that includes plan and subqueries
                     answer_tasks.append(self.generate_answer_with_plan_async(question, options, planning_v5_docs, plan_v5, planning_v5_queries, session))
@@ -1557,6 +1687,10 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                         docs = planning_v5_docs
                         queries = planning_v5_queries if planning_v5_queries else []
                         mode_plan = plan_v5
+                    elif mode == "planning_v4_grpo":
+                        docs = planning_v4_grpo_docs
+                        queries = planning_v4_grpo_queries if planning_v4_grpo_queries else []
+                        mode_plan = plan_v4_grpo
                     elif mode == "planning_v6":
                         docs = planning_v6_docs
                         queries = planning_v6_queries if planning_v6_queries else []
@@ -1609,6 +1743,8 @@ async def run_evaluation_async(
     vllm_max_concurrent: int = 1,
     vllm_max_model_len: int = 8192,
     total_docs: int = 15,
+    rewriter_adapter_path: Optional[str] = None,
+    rewriter_base_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     
@@ -1651,6 +1787,8 @@ async def run_evaluation_async(
         corpus_name=corpus_name,
         max_concurrent=max_concurrent,
         total_docs=total_docs,
+        rewriter_adapter_path=rewriter_adapter_path,
+        rewriter_base_model=rewriter_base_model,
         vllm_tensor_parallel_size=vllm_tensor_parallel_size,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_max_tokens=vllm_max_tokens,
@@ -1733,6 +1871,11 @@ async def run_evaluation_async(
             "modes": modes,
             "retriever_name": retriever_name if rag_modes else None,
             "corpus_name": corpus_name if rag_modes else None,
+            "retrieval_dataset": (
+                CORPUS_TO_RETRIEVAL_DATASET.get(corpus_name.lower())
+                if rag_modes and corpus_name
+                else None
+            ),
             "max_questions": max_questions,
             "total_evaluated": len(results),
             "max_concurrent": max_concurrent,
@@ -1835,12 +1978,24 @@ Examples:
     parser.add_argument('--llm-provider', type=str, default='openai', choices=['openai', 'vllm'],
                        help='LLM backend provider: openai API or local vLLM')
     parser.add_argument('--modes', '-m', nargs='+', 
-                       choices=['cot', 'direct', 'baseline', 'planning', 'planning_v2', 'planning_v3', 'planning_v4', 'planning_v5', 'planning_v6'],
+                       choices=['cot', 'direct', 'baseline', 'planning', 'planning_v2', 'planning_v3', 'planning_v4', 'planning_v4_grpo', 'planning_v5', 'planning_v6'],
                        default=['direct', 'baseline', 'planning'],
-                       help='Modes: v2=diagnostic, v3=adaptive, v4=answer-focused, v5=plan+queries, v6=dual-hypothesis')
+                       help='Modes: v2=diagnostic, v3=adaptive, v4=answer-focused, v4_grpo=GRPO-trained rewriter, v5=plan+queries, v6=dual-hypothesis')
     parser.add_argument('--model', type=str, default='gpt-4o-mini')
     parser.add_argument('--retriever', type=str, default='MedCPT')
-    parser.add_argument('--corpus', type=str, default='Textbooks')
+    parser.add_argument('--rewriter-adapter-path', type=str, default=None,
+                       help='Path to GRPO-trained LoRA adapter for rewriter (required for planning_v4_grpo mode)')
+    parser.add_argument('--rewriter-base-model', type=str, default=None,
+                       help='Base model for GRPO rewriter (defaults to --model)')
+    parser.add_argument(
+        '--retrieval-dataset',
+        type=parse_retrieval_dataset,
+        default=RETRIEVAL_DATASET_TO_CORPUS["textbooks"],
+        metavar='{textbooks,pubmed}',
+        help='Retrieval dataset for RAG modes (default: textbooks)',
+    )
+    # Backward compatibility: keep old flag, but prefer --retrieval-dataset.
+    parser.add_argument('--corpus', type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--output-dir', '-o', type=str, default='results')
     parser.add_argument('--vllm-tensor-parallel-size', type=int, default=1)
     parser.add_argument('--vllm-gpu-memory-utilization', type=float, default=0.9)
@@ -1854,13 +2009,15 @@ Examples:
     
     args = parser.parse_args()
     
+    corpus_name = args.corpus if args.corpus else args.retrieval_dataset
+
     # Run async evaluation
     asyncio.run(run_evaluation_async(
         max_questions=args.max_questions,
         llm_provider=args.llm_provider,
         model_name=args.model,
         retriever_name=args.retriever,
-        corpus_name=args.corpus,
+        corpus_name=corpus_name,
         max_concurrent=args.max_concurrent,
         output_dir=args.output_dir,
         modes=args.modes,
@@ -1870,6 +2027,8 @@ Examples:
         vllm_max_concurrent=args.vllm_max_concurrent,
         vllm_max_model_len=args.vllm_max_model_len,
         total_docs=args.total_docs,
+        rewriter_adapter_path=args.rewriter_adapter_path,
+        rewriter_base_model=args.rewriter_base_model,
     ))
 
 
