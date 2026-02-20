@@ -1,16 +1,16 @@
-# RAG Comparison Experiment
+# HypothesisRAG
 
-LangGraph 기반의 RAG(Retrieval-Augmented Generation) 비교 실험 도구입니다.
+의료 도메인 질의응답을 위한 검색 증강 생성(RAG) 파이프라인 실험 프로젝트입니다.
+현재 프로젝트의 **핵심 스크립트는 `evaluate_medqa.py`**이며, 이 중에서도 **`planning_v4`** 모드가 🩺가설(Hypothesis)을 세우고 이를 검증하기 위해 RAG를 수행하는 본 프로젝트의 **핵심 방법론**입니다.
 
 ## 목적
 
-세 가지 RAG 전략을 비교하여 Query Rewriting(특히 Planning 기반)이 검색 품질에 어떻게 도움이 되는지 확인합니다:
+여러 RAG 전략을 비교하여 모델이 스스로 가설을 세우고 검증하는 방식(Hypothesis 기반 Planning)이 검색 품질 및 최종 답변에 어떤 도움을 주는지 확인합니다:
 
-- **(A) direct_rag**: Query rewriting 없이 사용자 입력 그대로 검색
-- **(B) baseline_rewrite_rag**: LLM이 알아서 query rewriting (Planning 없음)
-- **(C) planning_rewrite_rag**: 간단한 planning 후 plan 기반 query rewriting
+- **(A) direct**: Query rewriting 없이 사용자 입력 그대로 검색
+- **(B) baseline**: LLM이 자체적으로 일반적인 query rewriting 수행
+- **(C) planning_v4 (⭐️ 핵심 방법론)**: 주어진 의료 문제에 대해 초기 진단 가설(Best Guess)을 세우고, 이 가설을 확정짓거나 감별 진단하기 위해 필요한 구체적 증거를 찾도록 타겟팅된 검색 쿼리를 생성하는 HypothesisRAG 방법론
 
-**주의**: 이 도구는 연구 실험용입니다. 의학적 조언을 제공하지 않으며, 진단 확정을 하지 않습니다.
 
 ## 설치
 
@@ -31,53 +31,10 @@ pip install -r requirements.txt
 export OPENAI_API_KEY="your-openai-api-key"
 ```
 
-## 사용법
 
-### 단일 쿼리 실행 (CLI)
+## MedQA 데이터셋 평가 (Async) - ⭐️ 핵심 스크립트 (`evaluate_medqa.py`)
 
-#### Direct Mode (Query Rewriting 없음)
-```bash
-python run_rag.py --mode direct \
-    --input "A 45-year-old man presents with fatigue, increased thirst, and frequent urination."
-```
-
-#### Baseline Mode (LLM Query Rewriting)
-```bash
-python run_rag.py --mode baseline \
-    --input "A 45-year-old man presents with fatigue, increased thirst, and frequent urination."
-```
-
-#### Planning Mode (Planning 기반 Query Rewriting)
-```bash
-python run_rag.py --mode planning \
-    --input "A 45-year-old man presents with fatigue, increased thirst, and frequent urination."
-```
-
-### 3-Way 비교 실행
-
-세 가지 모드를 한 번에 실행하고 비교:
-
-```bash
-python run_rag.py --compare \
-    --input "A 45-year-old man presents with fatigue, increased thirst, and frequent urination." \
-    --out comparison_results.json
-```
-
-### Batch 실행
-
-JSONL 파일로 여러 입력을 한 번에 처리:
-
-```bash
-# 모든 모드로 batch 실행
-python run_rag.py --input_file sample_data.jsonl --batch
-
-# 특정 모드만 실행
-python run_rag.py --input_file sample_data.jsonl --batch --modes direct planning
-```
-
-## MedQA 데이터셋 평가 (Async)
-
-MedQA testset을 사용하여 3-way RAG 비교 실험을 평가합니다. 비동기 처리를 통해 빠르게 수행됩니다.
+`evaluate_medqa.py`를 통해 전체 파이프라인 및 HypothesisRAG(`planning_v4`)의 성능을 평가합니다. 이 스크립트가 현 RAG 실험 및 검증의 코어(Core) 역할을 수행하며 비동기 처리를 통해 빠르게 실행됩니다.
 
 ### 평가 실행
 
@@ -89,8 +46,8 @@ python evaluate_medqa.py --max-questions 10
 # 주의: 모든 문제를 평가하려면 시간이 오래 걸릴 수 있습니다.
 python evaluate_medqa.py --max-questions 1273
 
-# 특정 모드만 평가
-python evaluate_medqa.py --modes direct planning --max-questions 50
+# 특정 모드만 평가 (예: 핵심 방법론인 planning_v4 집중 평가)
+python evaluate_medqa.py --modes direct baseline planning_v4 --max-questions 50
 
 # Evidence만 평가 (답변 생성 없음 - 검색 성능 측정용)
 python evaluate_medqa.py --no-answers --max-questions 100

@@ -1796,6 +1796,11 @@ async def run_evaluation_async(
         vllm_max_model_len=vllm_max_model_len,
     )
     
+    if rag_modes:
+        print(f"\nInitializing {corpus_name} retriever (this may take several minutes for large datasets like PubMed)...")
+        if hasattr(evaluator.retriever, "_lazy_init"):
+            evaluator.retriever._lazy_init()
+            
     results = []
     mode_stats = {mode: {"correct": 0, "total": 0} for mode in modes}
     
