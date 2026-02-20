@@ -92,8 +92,3 @@ python evaluate_medqa.py --no-answers --max-questions 100
 
 1. **MIRAGE 검색 시스템**: 실제 MIRAGE MedRAG 코퍼스가 설정되어 있어야 합니다. 설정되지 않은 경우 mock retrieval이 사용됩니다.
 2. **API 비용**: OpenAI API를 사용합니다. Planning 모드는 추가 LLM 호출이 필요합니다.
-3. **연구 목적**: 이 도구는 연구 실험용입니다. 의료 진단이나 조언 목적으로 사용하지 마세요.
-
-## 라이센스
-
-연구 및 교육 목적으로 자유롭게 사용할 수 있습니다.
