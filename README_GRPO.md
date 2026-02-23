@@ -34,28 +34,44 @@ Only the Rewriter's LoRA adapter parameters are updated. All other model weights
 ### 1. Install Dependencies
 
 ```bash
-pip install trl peft transformers datasets vllm accelerate bitsandbytes wandb
+pip install trl==0.28.0 vllm==0.12.0 "numpy<2.0.0" peft transformers datasets accelerate bitsandbytes wandb
+```
+
+**Important - MedRAG Connectivity:**
+To ensure the pipeline successfully connects to the local MedRAG retrieval modules, you must add the absolute paths to your `PYTHONPATH` before executing the Python scripts. Alternatively, you can use the `run_training.sh` wrapper which handles this automatically:
+
+```bash
+export PYTHONPATH=$PYTHONPATH:$(pwd)/MIRAGE:$(pwd)/MIRAGE/MedRAG:$(pwd)/MIRAGE/MedRAG/src
 ```
 
 ### 2. Train
 
 ```bash
-python training/train_rewriter_grpo.py \
-    --base_model google/gemma-2-9b-it \
-    --adapter_out_dir outputs/rewriter_grpo_lora \
+# Full fine-tuning (default)
+./run_training.sh \
+    --num_vllm_gpus 1 \
+    --num_train_gpus 2 \
+    --base_model Qwen/Qwen3-4B-Instruct-2507 \
+    --adapter_out_dir outputs/rewriter_grpo_full \
     --retriever_name MedCPT \
-    --corpus_name Textbooks \
-    --group_size 8 \
-    --steps 2000 \
-    --beta_kl 0.02 \
-    --seed 42
+    --corpus_name Textbooks
+
+# Or with LoRA enabled
+./run_training.sh \
+    --num_vllm_gpus 1 \
+    --num_train_gpus 2 \
+    --base_model Qwen/Qwen3-4B-Instruct-2507 \
+    --adapter_out_dir outputs/rewriter_grpo_lora \
+    --use_lora \
+    --retriever_name MedCPT \
+    --corpus_name Textbooks
 ```
 
 ### 3. Dry Run (validate pipeline without GPU training)
 
 ```bash
 python training/train_rewriter_grpo.py \
-    --base_model google/gemma-2-9b-it \
+    --base_model Qwen/Qwen3-4B-Instruct-2507 \
     --dry_run
 ```
 
@@ -67,7 +83,7 @@ Compare baseline rewriter vs GRPO-trained rewriter:
 # Standalone comparison script
 python scripts/eval_grpo.py \
     --adapter_path outputs/rewriter_grpo_lora \
-    --base_model google/gemma-2-9b-it \
+    --base_model Qwen/Qwen3-4B-Instruct-2507 \
     -n 100
 
 # Or within the main evaluation framework

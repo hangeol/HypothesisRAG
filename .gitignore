@@ -5,3 +5,6 @@ MIRAGE/MedRAG/corpus/*
 MIRAGE/prediction/*
 MIRAGE/rawdata/*
 MIRAGE/results/*
+outputs/*
+*.log
+trainlog.txt

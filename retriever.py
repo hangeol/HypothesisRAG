@@ -114,13 +114,11 @@ class MIRAGERetriever(BaseRetriever):
             print(f"✓ MIRAGE retriever initialized: {self.retriever_name} on {self.corpus_name}")
         except ImportError as e:
             print(f"✗ Failed to import MIRAGE retrieval system: {e}")
-            print("  Falling back to mock retrieval.")
-            self._retrieval_system = None
-            self._initialized = True
+            print("  Make sure MedRAG is accessible in your PYTHONPATH.")
+            raise RuntimeError(f"MedRAG import failed: {e}")
         except Exception as e:
             print(f"✗ Failed to initialize retrieval system: {e}")
-            self._retrieval_system = None
-            self._initialized = True
+            raise RuntimeError(f"Initialization failed: {e}")
     
     def retrieve(
         self,
@@ -142,8 +140,7 @@ class MIRAGERetriever(BaseRetriever):
         self._lazy_init()
         
         if self._retrieval_system is None:
-            # Return mock results
-            return self._mock_retrieve(query, k)
+            raise RuntimeError("Retrieval system is not initialized.")
         
         try:
             documents, scores = self._retrieval_system.retrieve(
@@ -177,23 +174,7 @@ class MIRAGERetriever(BaseRetriever):
             results.append((docs, scores))
         return results
     
-    def _mock_retrieve(
-        self,
-        query: str,
-        k: int,
-    ) -> Tuple[List[Dict[str, Any]], List[float]]:
-        """Return mock results when retrieval system is unavailable"""
-        documents = [
-            {
-                "id": f"mock_{i}",
-                "title": f"Mock Document {i}",
-                "content": f"This is mock content for query: {query}. "
-                          f"Document {i} contains placeholder text for testing."
-            }
-            for i in range(k)
-        ]
-        scores = [1.0 - i * 0.1 for i in range(k)]
-        return documents, scores
+
 
 
 class HybridRetriever(BaseRetriever):

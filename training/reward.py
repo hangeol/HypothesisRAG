@@ -197,6 +197,7 @@ class RewriterRewardFunction:
         gpu_memory_utilization: float = 0.4,
         max_model_len: int = 8192,
         retrieval_cache: Optional[Dict[str, Any]] = None,
+        generator_temperature: float = 0.0,
     ):
         """
         Args:
@@ -209,12 +210,15 @@ class RewriterRewardFunction:
             gpu_memory_utilization: vLLM GPU memory fraction for generator.
             max_model_len: vLLM max model length for generator.
             retrieval_cache: Optional shared cache dict for retrieval results.
+            generator_temperature: Sampling temperature for the frozen generator (default: 0.0).
         """
         self.reward_type = reward_type
         self.total_docs = total_docs
+        self.generator_temperature = generator_temperature
         self.retrieval_cache = retrieval_cache if retrieval_cache is not None else {}
         self.parse_failures = 0
         self.total_calls = 0
+        self.__name__ = self.__class__.__name__
 
         # Initialize retriever
         from retriever import create_retriever
@@ -225,23 +229,14 @@ class RewriterRewardFunction:
         )
         print(f"✓ Reward: retriever={retriever_name}, corpus={corpus_name}")
 
-        # Initialize frozen generator via vLLM
-        from vllm import LLM, SamplingParams
-        self.generator_llm = LLM(
-            model=generator_model_name,
-            dtype="bfloat16",
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-            trust_remote_code=True,
+        # Initialize frozen generator via OpenAI API
+        import openai
+        self.generator_llm = openai.OpenAI(
+            base_url="http://localhost:18081/v1",
+            api_key="empty",
         )
-        self.generator_tokenizer = self.generator_llm.get_tokenizer()
-        self.generator_sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=512,
-            stop=["###", "\n\n\n"],
-        )
-        print(f"✓ Reward: frozen generator={generator_model_name} loaded via vLLM")
+        self.generator_model_name = generator_model_name
+        print(f"✓ Reward: frozen generator={generator_model_name} loaded via OpenAI API")
 
     def _retrieve_documents(self, queries: List[str]) -> List[Dict[str, Any]]:
         """Retrieve and fuse documents from multiple queries (with caching)."""
@@ -283,8 +278,24 @@ class RewriterRewardFunction:
         options: Dict[str, str],
         retrieved_docs: List[Dict[str, Any]],
     ) -> str:
-        """Generate answer using frozen generator (single prompt, vLLM)."""
-        user_prompt = format_generator_prompt(question, options, retrieved_docs)
+        """Generate answer using frozen generator (single prompt, OpenAI API)."""
+        MAX_OUTPUT_TOKENS = 2048
+        MAX_MODEL_LEN = 8192
+        MAX_INPUT_TOKENS = MAX_MODEL_LEN - MAX_OUTPUT_TOKENS  # 6144
+
+        # Try with all docs first, then progressively remove docs if input is too long
+        docs_to_use = list(retrieved_docs)
+        while docs_to_use:
+            user_prompt = format_generator_prompt(question, options, docs_to_use)
+            # Rough token estimate: ~4 chars per token for English medical text
+            estimated_tokens = len(user_prompt) // 3
+            if estimated_tokens <= MAX_INPUT_TOKENS:
+                break
+            # Remove the last (lowest-scored) document and retry
+            docs_to_use = docs_to_use[:-1]
+
+        if not docs_to_use:
+            user_prompt = format_generator_prompt(question, options, [])
 
         messages = [
             {"role": "system", "content": MIRAGE_SYSTEM_PROMPT},
@@ -292,16 +303,17 @@ class RewriterRewardFunction:
         ]
 
         try:
-            prompt_text = self.generator_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            response = self.generator_llm.chat.completions.create(
+                model=self.generator_model_name,
+                messages=messages,
+                temperature=self.generator_temperature,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                stop=["###", "User:", "\n\n\n"],
             )
-        except Exception:
-            prompt_text = f"system: {MIRAGE_SYSTEM_PROMPT}\nuser: {user_prompt}\nassistant:"
-
-        outputs = self.generator_llm.generate(
-            [prompt_text], self.generator_sampling_params, use_tqdm=False
-        )
-        return outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            print(f"Warning: Reward generation failed: {e}")
+            return ""
 
     def _generate_answers_batch(
         self,
@@ -309,29 +321,15 @@ class RewriterRewardFunction:
         options_list: List[Dict[str, str]],
         docs_list: List[List[Dict[str, Any]]],
     ) -> List[str]:
-        """Generate answers for a batch of questions using frozen generator (vLLM batched)."""
-        prompts = []
-        for question, options, retrieved_docs in zip(questions, options_list, docs_list):
-            user_prompt = format_generator_prompt(question, options, retrieved_docs)
-            messages = [
-                {"role": "system", "content": MIRAGE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-            try:
-                prompt_text = self.generator_tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            except Exception:
-                prompt_text = f"system: {MIRAGE_SYSTEM_PROMPT}\nuser: {user_prompt}\nassistant:"
-            prompts.append(prompt_text)
-
-        outputs = self.generator_llm.generate(
-            prompts, self.generator_sampling_params, use_tqdm=False
-        )
-        return [
-            o.outputs[0].text if o.outputs else ""
-            for o in outputs
-        ]
+        """Generate answers for a batch of questions using frozen generator (OpenAI API ThreadPool)."""
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def _call_api(args):
+            return self._generate_answer(*args)
+            
+        with ThreadPoolExecutor(max_workers=min(16, len(questions) + 1)) as executor:
+            args_list = list(zip(questions, options_list, docs_list))
+            return list(executor.map(_call_api, args_list))
 
     def __call__(
         self,

@@ -91,6 +91,7 @@ def load_medqa_benchmark(benchmark_path: Optional[str] = None, split: str = "med
     """
     if benchmark_path is None:
         possible_paths = [
+            os.path.join(_PROJECT_ROOT, "data", "medqa_train.json"),
             os.path.join(_PROJECT_ROOT, "MIRAGE", "benchmark.json"),
             os.path.join(_PROJECT_ROOT, "..", "MIRAGE", "benchmark.json"),
             "/mnt/data1/home/hangeol/project/MIRAGE/benchmark.json",
@@ -112,6 +113,9 @@ def load_medqa_benchmark(benchmark_path: Optional[str] = None, split: str = "med
 
 def parse_plan_json(response: str) -> Dict[str, Any]:
     """Parse JSON plan from LLM response."""
+    import re
+    # Strip Qwen3 thinking tags if present
+    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
     try:
         if "{" in response and "}" in response:
             start = response.find("{")
@@ -130,8 +134,9 @@ def generate_plans_vllm(
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
+    hypothesis_temperature: float = 0.0,
 ) -> Dict[str, Dict[str, Any]]:
-    """Generate plans for all questions using vLLM (temp=0, frozen planner).
+    """Generate plans for all questions using vLLM (frozen hypothesis/planner).
 
     Args:
         questions: List of question dicts with 'question' and 'options'.
@@ -141,6 +146,7 @@ def generate_plans_vllm(
         tensor_parallel_size: vLLM tensor parallelism.
         gpu_memory_utilization: vLLM GPU memory fraction.
         max_model_len: Maximum model context length.
+        hypothesis_temperature: Sampling temperature for the planner (default: 0.0).
 
     Returns:
         Dict mapping question_id -> plan dict.
@@ -175,7 +181,7 @@ def generate_plans_vllm(
         trust_remote_code=True,
     )
     tokenizer = llm.get_tokenizer()
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=512, stop=["###", "\n\n\n"])
+    sampling_params = SamplingParams(temperature=hypothesis_temperature, max_tokens=2048, stop=["###", "\n\n\n"])
 
     # Build prompts
     prompts = []
@@ -192,8 +198,17 @@ def generate_plans_vllm(
 
         try:
             prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,  # Disable Qwen3 thinking to get clean JSON
             )
+        except TypeError:
+            # Fallback for tokenizers that don't support enable_thinking
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt_text = f"system: {PLANNER_SYSTEM_PROMPT}\nuser: {user_msg}\nassistant:"
         except Exception:
             prompt_text = f"system: {PLANNER_SYSTEM_PROMPT}\nuser: {user_msg}\nassistant:"
 
@@ -272,6 +287,7 @@ def build_grpo_dataset(
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
+    hypothesis_temperature: float = 0.0,
 ):
     """Build a HuggingFace Dataset for GRPO training.
 
@@ -291,6 +307,7 @@ def build_grpo_dataset(
         tensor_parallel_size: vLLM tensor parallelism for plan generation.
         gpu_memory_utilization: vLLM GPU memory fraction.
         max_model_len: vLLM max model context length.
+        hypothesis_temperature: Sampling temperature for the hypothesis/planner (default: 0.0).
 
     Returns:
         datasets.Dataset
@@ -321,6 +338,7 @@ def build_grpo_dataset(
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
+        hypothesis_temperature=hypothesis_temperature,
     )
 
     # Build dataset rows
