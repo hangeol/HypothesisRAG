@@ -428,13 +428,18 @@ class AsyncOpenAIClient:
         model: str = "gpt-4o-mini",
         max_concurrent: int = 100,
         max_retries: int = 3,
+        api_base: Optional[str] = None,
     ):
         self.api_key = api_key
         self.model = model
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
         self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self._is_local = bool(api_base)
+        if api_base:
+            self.base_url = api_base.rstrip('/') + '/chat/completions'
+        else:
+            self.base_url = "https://api.openai.com/v1/chat/completions"
     
     async def chat_completion(
         self,
@@ -453,8 +458,17 @@ class AsyncOpenAIClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": 2048,
         }
+
+        # For local vLLM servers: disable Qwen3 thinking mode to avoid
+        # extremely long <think> chains that make requests take 10+ minutes.
+        if self._is_local:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         
+        # Use longer timeout for local vLLM (model inference is slower than API)
+        request_timeout = aiohttp.ClientTimeout(total=300 if self._is_local else 60)
+
         async with self.semaphore:
             for attempt in range(self.max_retries):
                 try:
@@ -462,7 +476,7 @@ class AsyncOpenAIClient:
                         self.base_url,
                         headers=headers,
                         json=payload,
-                        timeout=aiohttp.ClientTimeout(total=60),
+                        timeout=request_timeout,
                     ) as response:
                         if response.status == 200:
                             data = await response.json()
@@ -611,6 +625,7 @@ class AsyncRAGEvaluator:
         vllm_max_model_len: int = 8192,
         rewriter_adapter_path: Optional[str] = None,
         rewriter_base_model: Optional[str] = None,
+        api_base: Optional[str] = None,
     ):
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
@@ -626,6 +641,7 @@ class AsyncRAGEvaluator:
                 api_key=self.api_key,
                 model=model_name,
                 max_concurrent=max_concurrent,
+                api_base=api_base,
             )
         elif self.llm_provider == "vllm":
             self.client = VLLMAsyncClient(
@@ -639,30 +655,47 @@ class AsyncRAGEvaluator:
         else:
             raise ValueError(f"Unsupported llm_provider: {llm_provider}")
 
-        # GRPO-trained rewriter adapter (optional, for planning_v4_grpo mode)
+        # GRPO-trained rewriter (optional, for planning_v4_grpo mode)
+        # Supports both LoRA adapters and full fine-tuned checkpoints.
         self.grpo_rewriter_model = None
         self.grpo_rewriter_tokenizer = None
         if rewriter_adapter_path:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            from peft import PeftModel
 
             base_name = rewriter_base_model or model_name
-            print(f"Loading GRPO rewriter adapter from {rewriter_adapter_path}...")
-            self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
-                base_name, trust_remote_code=True
-            )
-            if self.grpo_rewriter_tokenizer.pad_token is None:
-                self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
-            base_model = AutoModelForCausalLM.from_pretrained(
-                base_name, torch_dtype=torch.bfloat16,
-                device_map="auto", trust_remote_code=True,
-            )
-            self.grpo_rewriter_model = PeftModel.from_pretrained(
-                base_model, rewriter_adapter_path
-            )
-            self.grpo_rewriter_model.eval()
-            print(f"✓ GRPO rewriter adapter loaded (base: {base_name})")
+            is_lora = os.path.exists(os.path.join(rewriter_adapter_path, "adapter_config.json"))
+
+            if is_lora:
+                from peft import PeftModel
+                print(f"Loading GRPO rewriter LoRA adapter from {rewriter_adapter_path}...")
+                self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
+                    base_name, trust_remote_code=True
+                )
+                if self.grpo_rewriter_tokenizer.pad_token is None:
+                    self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
+                base_m = AutoModelForCausalLM.from_pretrained(
+                    base_name, torch_dtype=torch.bfloat16,
+                    device_map="auto", trust_remote_code=True,
+                )
+                self.grpo_rewriter_model = PeftModel.from_pretrained(
+                    base_m, rewriter_adapter_path
+                )
+                self.grpo_rewriter_model.eval()
+                print(f"✓ GRPO rewriter LoRA adapter loaded (base: {base_name})")
+            else:
+                print(f"Loading GRPO rewriter full checkpoint from {rewriter_adapter_path}...")
+                self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
+                    rewriter_adapter_path, trust_remote_code=True
+                )
+                if self.grpo_rewriter_tokenizer.pad_token is None:
+                    self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
+                self.grpo_rewriter_model = AutoModelForCausalLM.from_pretrained(
+                    rewriter_adapter_path, torch_dtype=torch.bfloat16,
+                    device_map="auto", trust_remote_code=True,
+                )
+                self.grpo_rewriter_model.eval()
+                print(f"✓ GRPO rewriter full checkpoint loaded from {rewriter_adapter_path}")
         
         # Initialize retriever (sync, but fast)
         self.retriever = create_retriever(
@@ -1745,6 +1778,7 @@ async def run_evaluation_async(
     total_docs: int = 15,
     rewriter_adapter_path: Optional[str] = None,
     rewriter_base_model: Optional[str] = None,
+    api_base: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     
@@ -1794,6 +1828,7 @@ async def run_evaluation_async(
         vllm_max_tokens=vllm_max_tokens,
         vllm_max_concurrent=vllm_max_concurrent,
         vllm_max_model_len=vllm_max_model_len,
+        api_base=api_base,
     )
     
     if rag_modes:
@@ -1954,6 +1989,435 @@ async def run_evaluation_async(
     return summary
 
 
+# ============================================================================
+# Batch-Phased Evaluation (for checkpoint evaluation)
+# ============================================================================
+# Process ALL questions per phase with full VRAM utilization.
+# Only ONE model on GPU at a time → gpu_mem=0.9, full vLLM batching.
+#
+# Each vLLM phase runs in a SEPARATE subprocess so GPU memory is
+# naturally freed when the subprocess exits. Data passes via temp files.
+#
+# Phase 1: Plan ALL questions    (base model)      [subprocess]
+# Phase 2: Rewrite ALL queries   (checkpoint model) [subprocess]
+# Phase 3: Retrieve ALL          (CPU, in-process)
+# Phase 4: Answer ALL questions  (base model)      [subprocess]
+# ============================================================================
+
+import pickle
+import tempfile
+import multiprocessing as _mp
+
+
+def _format_chat_messages(tokenizer, messages: List[Dict[str, str]]) -> str:
+    """Format chat messages into a prompt for vLLM generate()."""
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            lines.append(f"{role}: {content}")
+        lines.append("assistant:")
+        return "\n".join(lines)
+
+
+def _extract_vllm_output_texts(outputs) -> List[str]:
+    """
+    Normalize vLLM outputs (chat() or generate()) into a list of strings.
+    Supports a few return shapes across vLLM versions.
+    """
+    if outputs is None:
+        return []
+
+    if isinstance(outputs, tuple):
+        outputs = list(outputs)
+    elif not isinstance(outputs, list):
+        outputs = [outputs]
+
+    texts = []
+    for out in outputs:
+        text = ""
+        if hasattr(out, "outputs"):
+            try:
+                first = out.outputs[0]
+                if hasattr(first, "text"):
+                    text = first.text
+            except Exception:
+                text = ""
+        elif isinstance(out, dict):
+            if "choices" in out and out["choices"]:
+                choice = out["choices"][0]
+                if isinstance(choice, dict):
+                    message = choice.get("message", {})
+                    if isinstance(message, dict):
+                        text = message.get("content", "") or text
+                    else:
+                        text = choice.get("text", text)
+                else:
+                    text = getattr(choice, "text", text)
+            elif "text" in out:
+                text = out.get("text", "")
+        elif isinstance(out, str):
+            text = out
+
+        texts.append("" if text is None else str(text))
+
+    return texts
+
+
+def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
+                          output_file: str, gpu_mem: float,
+                          max_model_len: int, max_tokens: int):
+    """
+    Subprocess entry: load vLLM model, run batch chat, save outputs, exit.
+    All GPU memory is freed when this process exits.
+    """
+    from vllm import LLM, SamplingParams
+
+    # Load messages
+    with open(messages_list_file, "rb") as f:
+        messages_list = pickle.load(f)
+
+    print(f"    [subprocess] Loading model: {os.path.basename(model_path)} ...")
+    llm = LLM(
+        model=model_path,
+        gpu_memory_utilization=gpu_mem,
+        max_model_len=max_model_len,
+        trust_remote_code=True,
+        enforce_eager=True,
+    )
+
+    sampling = SamplingParams(temperature=0, max_tokens=max_tokens)
+    print(f"    [subprocess] Running batch inference on {len(messages_list)} inputs ...")
+
+    prompts = [_format_chat_messages(llm.get_tokenizer(), m) for m in messages_list]
+    try:
+        outputs = llm.chat(messages=messages_list, sampling_params=sampling)
+    except Exception:
+        outputs = llm.generate(prompts, sampling_params=sampling, use_tqdm=False)
+
+    # Extract text outputs
+    result_texts = _extract_vllm_output_texts(outputs)
+    if len(result_texts) < len(messages_list):
+        result_texts.extend([""] * (len(messages_list) - len(result_texts)))
+    if len(result_texts) != len(messages_list):
+        raise RuntimeError(
+            f"Unexpected vLLM output count: got {len(result_texts)} for {len(messages_list)} inputs"
+        )
+
+    with open(output_file, "wb") as f:
+        pickle.dump(result_texts, f)
+
+    print(f"    [subprocess] Done. Exiting to free GPU memory.")
+    # Process exit frees all GPU memory automatically
+
+
+def _run_phase_in_subprocess(model_path: str, messages_list: list,
+                             gpu_mem: float, max_model_len: int,
+                             max_tokens: int) -> list:
+    """Run a vLLM batch in a subprocess and return result texts."""
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f_in:
+        pickle.dump(messages_list, f_in)
+        input_path = f_in.name
+
+    output_path = input_path + ".out.pkl"
+
+    try:
+        p = _mp.Process(
+            target=_run_vllm_batch_phase,
+            args=(model_path, input_path, output_path,
+                  gpu_mem, max_model_len, max_tokens),
+        )
+        p.start()
+        p.join()
+
+        if p.exitcode != 0:
+            raise RuntimeError(f"vLLM subprocess failed (exit={p.exitcode})")
+
+        with open(output_path, "rb") as f:
+            return pickle.load(f)
+    finally:
+        for fp in [input_path, output_path]:
+            try:
+                os.unlink(fp)
+            except OSError:
+                pass
+
+
+def run_batch_phased_evaluation(
+    base_model: str,
+    rewriter_checkpoint: str,
+    max_questions: int = 1273,
+    total_docs: int = 15,
+    gpu_mem: float = 0.9,
+    max_model_len: int = 8192,
+    max_tokens: int = 2048,
+    output_dir: str = "results",
+    retriever_name: str = "MedCPT",
+    corpus_name: str = "Textbooks",
+) -> Dict[str, Any]:
+    """
+    Batch-phased evaluation: process ALL questions per phase.
+    Each vLLM phase runs in a separate subprocess → full GPU memory release.
+    """
+    from data.medqa_loader import format_rewriter_prompt
+    from training.reward import parse_queries_from_completion
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load dataset
+    dataset = MedQADataset()
+    n = min(max_questions, len(dataset))
+    questions = [dataset[i] for i in range(n)]
+    print(f"\n{'='*70}")
+    print(f"Batch-Phased Evaluation: {n} questions")
+    print(f"Base model:  {base_model}")
+    print(f"Checkpoint:  {rewriter_checkpoint}")
+    print(f"gpu_mem={gpu_mem}  max_model_len={max_model_len}  max_tokens={max_tokens}")
+    print(f"{'='*70}")
+
+    t_total = time.time()
+
+    # ── Phase 1: Plan ALL (base model, subprocess) ──
+    print(f"\n[Phase 1/4] Generating plans for {n} questions (base model) ...")
+    t1 = time.time()
+
+    plan_messages = []
+    for qd in questions:
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        prompt = PLANNING_V4_PROMPT.format(
+            question=qd["question"], options=options_text)
+        plan_messages.append([
+            {"role": "system",
+             "content": "You are an expert medical diagnostician. "
+                        "Make your best diagnostic guess and identify "
+                        "what evidence would confirm it."},
+            {"role": "user", "content": prompt},
+        ])
+
+    plan_texts = _run_phase_in_subprocess(
+        base_model, plan_messages, gpu_mem, max_model_len, max_tokens)
+
+    plans = []
+    for idx, text in enumerate(plan_texts):
+        try:
+            if '{' in text and '}' in text:
+                p = json.loads(text[text.find('{'):text.rfind('}')+1])
+            else:
+                p = {}
+        except Exception:
+            p = {}
+        p.setdefault("discriminating_features", [])
+        p.setdefault("best_guess", "")
+        p.setdefault("reasoning", "")
+        p.setdefault("confirming_evidence", [])
+        p.setdefault("alternative_if_wrong", "")
+        if not p["discriminating_features"]:
+            words = re.findall(r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
+            p["discriminating_features"] = words[:3] or ["symptom"]
+        plans.append(p)
+
+    print(f"  ✓ Phase 1 done: {len(plans)} plans in {time.time()-t1:.1f}s")
+
+    # ── Phase 2: Rewrite ALL (checkpoint model, subprocess) ──
+    print(f"\n[Phase 2/4] Generating queries for {n} questions (checkpoint) ...")
+    t2 = time.time()
+
+    rw_messages = []
+    for i, qd in enumerate(questions):
+        msgs = format_rewriter_prompt(qd["question"], qd["options"], plans[i])
+        rw_messages.append(msgs)
+
+    rw_texts = _run_phase_in_subprocess(
+        rewriter_checkpoint, rw_messages, gpu_mem, max_model_len, max_tokens)
+
+    all_queries = []
+    for i, text in enumerate(rw_texts):
+        queries = parse_queries_from_completion(text)
+        if len(queries) < 2:
+            p = plans[i]
+            bg = p.get("best_guess", "")
+            cf = ", ".join(p.get("confirming_evidence", [])[:3])
+            df = ", ".join(p.get("discriminating_features", [])[:3])
+            queries = [f"{bg} {df}", cf,
+                       f"{p.get('reasoning','')} diagnosis"]
+        all_queries.append(queries[:5])
+
+    print(f"  ✓ Phase 2 done: {len(all_queries)} query sets in "
+          f"{time.time()-t2:.1f}s")
+
+    # ── Phase 3: Retrieve ALL (CPU, in-process) ──
+    print(f"\n[Phase 3/4] Retrieving documents for {n} questions ...")
+    t3 = time.time()
+
+    try:
+        from retriever import create_retriever
+        retriever = create_retriever(
+            retriever_type="mirage",
+            retriever_name=retriever_name,
+            corpus_name=corpus_name,
+        )
+        if hasattr(retriever, "_lazy_init"):
+            retriever._lazy_init()
+    except Exception as e:
+        print(f"  WARNING: Retriever init failed: {e}")
+        retriever = None
+
+    all_docs = []
+    for i, queries in enumerate(all_queries):
+        doc_scores: Dict[str, float] = {}
+        doc_data: Dict[str, Dict[str, Any]] = {}
+        if retriever:
+            k_per = max(1, total_docs // max(len(queries), 1))
+            for q in queries:
+                try:
+                    docs, scores = retriever.retrieve(q, k=k_per)
+                    for doc, score in zip(docs, scores):
+                        doc_id = doc.get(
+                            "id",
+                            doc.get("title", str(hash(doc.get("content", "")[:100])))
+                        )
+                        if doc_id not in doc_scores:
+                            doc_scores[doc_id] = 0.0
+                            doc_data[doc_id] = doc.copy()
+                            doc_data[doc_id]["query_trace"] = []
+                        try:
+                            doc_scores[doc_id] += float(score)
+                        except Exception:
+                            doc_scores[doc_id] += 0.0
+                        doc_data[doc_id]["query_trace"].append(q)
+                except Exception:
+                    pass
+
+        docs_sorted = []
+        for doc_id in sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True):
+            doc = doc_data[doc_id]
+            doc["fused_score"] = doc_scores[doc_id]
+            docs_sorted.append(doc)
+
+        all_docs.append(docs_sorted)
+        if (i + 1) % 200 == 0:
+            print(f"  ... {i+1}/{n} retrieved")
+
+    print(f"  ✓ Phase 3 done: retrieval in {time.time()-t3:.1f}s")
+
+    # ── Phase 4: Answer ALL (base model, subprocess) ──
+    print(f"\n[Phase 4/4] Generating answers for {n} questions (base model) ...")
+    t4 = time.time()
+
+    try:
+        from template import general_medrag_system
+        system_prompt = general_medrag_system
+    except ImportError:
+        system_prompt = "You are a helpful medical assistant."
+
+    ans_messages = []
+    for i, qd in enumerate(questions):
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        docs = all_docs[i]
+        ctx = "\n\n".join(
+            [f"Document [{j+1}] (Title: {d.get('title','Untitled')})\n"
+             f"{d.get('content','')}"
+             for j, d in enumerate(docs[:25])]
+        ) or "No documents."
+        user_prompt = (
+            f"Here are the relevant documents:\n{ctx}\n\n"
+            f"Here is the question:\n{qd['question']}\n\n"
+            f"Here are the potential choices:\n{options_text}\n\n"
+            f"Please think step-by-step and generate your output in json:")
+        ans_messages.append([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
+
+    ans_texts = _run_phase_in_subprocess(
+        base_model, ans_messages, gpu_mem, max_model_len, max_tokens)
+
+    print(f"  ✓ Phase 4 done: answers in {time.time()-t4:.1f}s")
+
+    # ── Compile Results ──
+    print(f"\n[Result] Compiling ...")
+    results = []
+    correct = 0
+    total = 0
+    for i, qd in enumerate(questions):
+        correct_answer = qd.get("answer_idx", qd.get("answer", ""))
+        raw_resp = ans_texts[i]
+        predicted = parse_answer(raw_resp)
+        is_correct = predicted.upper() == correct_answer.upper()
+        if is_correct:
+            correct += 1
+        total += 1
+        results.append({
+            "question_id": i,
+            "question": qd["question"],
+            "options": qd["options"],
+            "correct_answer": correct_answer,
+            "modes": {
+                "planning_v4_grpo": {
+                    "num_queries": len(all_queries[i]),
+                    "num_docs": len(all_docs[i]),
+                    "queries": all_queries[i],
+                    "plan": plans[i],
+                    "raw_response": raw_resp,
+                    "predicted_answer": predicted,
+                    "is_correct": is_correct,
+                }
+            },
+        })
+
+    elapsed = time.time() - t_total
+    accuracy = correct / total * 100 if total > 0 else 0
+
+    summary = {
+        "config": {
+            "base_model": base_model,
+            "rewriter_checkpoint": rewriter_checkpoint,
+            "total_evaluated": total,
+            "total_docs": total_docs,
+            "gpu_mem": gpu_mem,
+            "max_model_len": max_model_len,
+            "max_tokens": max_tokens,
+        },
+        "timing": {
+            "total_seconds": elapsed,
+            "avg_per_question": elapsed / total if total else 0,
+            "questions_per_minute": total / elapsed * 60 if elapsed > 0 else 0,
+        },
+        "mode_results": {
+            "planning_v4_grpo": {
+                "correct": correct, "total": total, "accuracy": accuracy,
+            }
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    print(f"\n{'='*70}")
+    print(f"RESULTS: {accuracy:.1f}% ({correct}/{total}) in {elapsed:.0f}s "
+          f"({summary['timing']['questions_per_minute']:.1f} q/min)")
+    print(f"{'='*70}")
+
+    # Save
+    ckpt_name = os.path.basename(rewriter_checkpoint)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file = os.path.join(output_dir,
+                            f"medqa_grpo_{ckpt_name}_{ts}.json")
+    with open(out_file, "w") as f:
+        json.dump({"summary": summary, "results": results},
+                  f, indent=2, ensure_ascii=False)
+    print(f"✓ Saved: {out_file}")
+
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MedQA Max Async Parallel Evaluation",
@@ -2002,6 +2466,8 @@ Examples:
     # Backward compatibility: keep old flag, but prefer --retrieval-dataset.
     parser.add_argument('--corpus', type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--output-dir', '-o', type=str, default='results')
+    parser.add_argument('--api-base', type=str, default=None,
+                       help='Custom API base URL (e.g. http://localhost:18081/v1 for local vLLM server)')
     parser.add_argument('--vllm-tensor-parallel-size', type=int, default=1)
     parser.add_argument('--vllm-gpu-memory-utilization', type=float, default=0.9)
     parser.add_argument('--vllm-max-tokens', type=int, default=4096)
@@ -2034,6 +2500,7 @@ Examples:
         total_docs=args.total_docs,
         rewriter_adapter_path=args.rewriter_adapter_path,
         rewriter_base_model=args.rewriter_base_model,
+        api_base=args.api_base,
     ))
 
 
