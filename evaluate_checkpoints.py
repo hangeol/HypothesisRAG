@@ -6,17 +6,21 @@ Thin wrapper: discovers checkpoints, assigns GPUs, and launches
 evaluate_medqa.run_batch_phased_evaluation() in a separate process
 per GPU. Each GPU processes checkpoints sequentially.
 
-Architecture (per GPU, per checkpoint):
-  Phase 1: Plan ALL questions    (base model, gpu_mem=0.9)
-  Phase 2: Rewrite ALL           (checkpoint model — swap)
-  Phase 3: Retrieve ALL          (CPU)
-  Phase 4: Answer ALL            (base model — swap back)
+Supports TWO modes (auto-detected from hyperparameters.json):
+  rewriter   — checkpoint used in Phase 2 (rewrite queries)
+  hypothesis — checkpoint used in Phase 1 (generate diagnostic plan)
 
 Only one model on GPU at a time → full vLLM batch throughput.
 
 Usage:
+  # Rewriter checkpoints (auto-detected)
   python evaluate_checkpoints.py \\
     outputs/rewriter_grpo_lora/20260224_014411 \\
+    --gpus 3,4,5 --max-questions 1273
+
+  # Hypothesis checkpoints (auto-detected)
+  python evaluate_checkpoints.py \\
+    outputs/hypothesis_grpo_lora/20260225_012054 \\
     --gpus 3,4,5 --max-questions 1273
 """
 
@@ -29,7 +33,7 @@ import sys
 import time
 import multiprocessing as mp
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ── Project paths ────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +62,17 @@ def discover_checkpoints(training_dir: str, every_n: int = 1) -> list:
 def read_hyperparameters(training_dir: str) -> dict:
     with open(os.path.join(training_dir, "hyperparameters.json")) as f:
         return json.load(f)
+
+
+def detect_mode(hparams: dict) -> str:
+    """Auto-detect evaluation mode from hyperparameters.
+    Returns 'hypothesis' if adapter_out_dir contains 'hypothesis',
+    otherwise 'rewriter'.
+    """
+    adapter_dir = hparams.get("adapter_out_dir", "")
+    if "hypothesis" in adapter_dir.lower():
+        return "hypothesis"
+    return "rewriter"
 
 
 def is_checkpoint_done(results_dir: str, step: int) -> bool:
@@ -114,6 +129,10 @@ def gpu_worker(
     gpu_mem: float,
     max_model_len: int,
     max_tokens: int,
+    mode: str = "rewriter",
+    hypothesis_checkpoint: Optional[str] = None,
+    rewriter_checkpoint: Optional[str] = None,
+    generator_checkpoint: Optional[str] = None,
 ):
     """
     Worker process for one GPU.
@@ -121,7 +140,7 @@ def gpu_worker(
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     tag = f"[GPU {gpu_id}]"
-    print(f"{tag} Worker started (PID {os.getpid()})")
+    print(f"{tag} Worker started (PID {os.getpid()}, mode={mode})")
 
     # Late import (after CUDA_VISIBLE_DEVICES is set)
     from evaluate_medqa import run_batch_phased_evaluation
@@ -137,9 +156,9 @@ def gpu_worker(
         print(f"\n{tag} ═══ Checkpoint {step} ═══")
         t0 = time.time()
         try:
-            run_batch_phased_evaluation(
+            # Build kwargs based on mode: checkpoint goes to the right module
+            kwargs = dict(
                 base_model=base_model,
-                rewriter_checkpoint=ckpt_path,
                 max_questions=max_questions,
                 total_docs=total_docs,
                 gpu_mem=effective_gpu_mem,
@@ -147,6 +166,22 @@ def gpu_worker(
                 max_tokens=max_tokens,
                 output_dir=out_dir,
             )
+            if mode == "hypothesis":
+                kwargs["hypothesis_checkpoint"] = ckpt_path
+                # Pass additional fixed checkpoints if specified
+                if rewriter_checkpoint:
+                    kwargs["rewriter_checkpoint"] = rewriter_checkpoint
+                if generator_checkpoint:
+                    kwargs["generator_checkpoint"] = generator_checkpoint
+            else:
+                kwargs["rewriter_checkpoint"] = ckpt_path
+                # Pass additional fixed checkpoints if specified
+                if hypothesis_checkpoint:
+                    kwargs["hypothesis_checkpoint"] = hypothesis_checkpoint
+                if generator_checkpoint:
+                    kwargs["generator_checkpoint"] = generator_checkpoint
+
+            run_batch_phased_evaluation(**kwargs)
             elapsed = time.time() - t0
             print(f"{tag} ✓ Checkpoint {step} done in {elapsed:.0f}s")
         except Exception as e:
@@ -223,6 +258,9 @@ def main():
         description="Orchestrate GRPO checkpoint evaluation on MedQA")
     parser.add_argument("training_dir",
                         help="Training output dir with checkpoint-* dirs")
+    parser.add_argument("--mode", choices=["rewriter", "hypothesis"],
+                        default=None,
+                        help="Evaluation mode (default: auto-detect)")
     parser.add_argument("--gpus", default="3,4,5",
                         help="Comma-separated GPU IDs (default: 3,4,5)")
     parser.add_argument("--max-questions", "-n", type=int, default=1273)
@@ -233,12 +271,22 @@ def main():
                         help="GPU memory utilization (default: 0.9)")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    # Per-module checkpoint overrides (fixed, not iterated)
+    parser.add_argument("--hypothesis-checkpoint", type=str, default=None,
+                        help="Fixed hypothesis checkpoint (when mode=rewriter)")
+    parser.add_argument("--rewriter-checkpoint", type=str, default=None,
+                        help="Fixed rewriter checkpoint (when mode=hypothesis)")
+    parser.add_argument("--generator-checkpoint", type=str, default=None,
+                        help="Fixed generator checkpoint")
     args = parser.parse_args()
 
     training_dir = os.path.abspath(args.training_dir)
     hparams = read_hyperparameters(training_dir)
     base_model = hparams["base_model"]
+    mode = args.mode if args.mode else detect_mode(hparams)
+
     print(f"Base model: {base_model}")
+    print(f"Mode: {mode}")
 
     checkpoints = discover_checkpoints(training_dir, args.every_n)
     if not checkpoints:
@@ -277,7 +325,9 @@ def main():
             target=gpu_worker,
             args=(gpu_id, assignment[gpu_id], base_model, results_base,
                   args.max_questions, args.total_docs, args.gpu_mem,
-                  args.max_model_len, args.max_tokens),
+                  args.max_model_len, args.max_tokens,
+                  mode, args.hypothesis_checkpoint,
+                  args.rewriter_checkpoint, args.generator_checkpoint),
         )
         processes.append(p)
         p.start()

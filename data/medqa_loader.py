@@ -22,6 +22,9 @@ from typing import Dict, List, Any, Optional
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 
+# Import prompts from central prompts.py
+from prompts import HYPOTHESIS_PROMPTS, REWRITING_PROMPTS
+
 
 # ============================================================================
 # Rewriter prompt template (plan-conditioned, 3 queries)
@@ -51,6 +54,30 @@ Query 3: <query>"""
 
 
 REWRITER_SYSTEM_PROMPT = "You are a medical search query expert. Generate precise, targeted search queries. Output ONLY the 3 queries in the exact format requested. No explanations."
+
+
+# ============================================================================
+# Hypothesis prompt template (PLAN_GENERATION_V4 format)
+# ============================================================================
+HYPOTHESIS_SYSTEM_PROMPT = "You are an expert medical diagnostician taking a medical licensing exam."
+
+HYPOTHESIS_GRPO_PROMPT = """Question: {question}
+
+Options:
+{options}
+
+Step 1: Identify the KEY DISCRIMINATING FEATURES that distinguish between the options.
+Step 2: Make your BEST GUESS for the answer based on medical knowledge.
+Step 3: Identify what SPECIFIC EVIDENCE would CONFIRM your answer.
+
+Output in JSON:
+{{
+    "discriminating_features": ["2-3 features that distinguish between options"],
+    "best_guess": "A/B/C/D",
+    "reasoning": "brief explanation why this is the best answer",
+    "confirming_evidence": ["1-3 specific facts that would confirm this answer"],
+    "alternative_if_wrong": "A/B/C/D - only if uncertain"
+}}"""
 
 
 # ============================================================================
@@ -135,6 +162,7 @@ def generate_plans_vllm(
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
     hypothesis_temperature: float = 0.0,
+    hypothesis_prompt_version: str = "v6",
 ) -> Dict[str, Dict[str, Any]]:
     """Generate plans for all questions using vLLM (frozen hypothesis/planner).
 
@@ -188,11 +216,12 @@ def generate_plans_vllm(
     for q_data in missing_questions:
         question = q_data["question"]
         options = q_data["options"]
+        h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt_version]
         options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
-        user_msg = PLANNING_V4_PROMPT.format(question=question, options=options_text)
+        user_msg = h_prompt["user"].format(question=question, options=options_text)
 
         messages = [
-            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "system", "content": h_prompt["system"]},
             {"role": "user", "content": user_msg},
         ]
 
@@ -208,9 +237,9 @@ def generate_plans_vllm(
                     messages, tokenize=False, add_generation_prompt=True
                 )
             except Exception:
-                prompt_text = f"system: {PLANNER_SYSTEM_PROMPT}\nuser: {user_msg}\nassistant:"
+                prompt_text = f"system: {h_prompt['system']}\nuser: {user_msg}\nassistant:"
         except Exception:
-            prompt_text = f"system: {PLANNER_SYSTEM_PROMPT}\nuser: {user_msg}\nassistant:"
+            prompt_text = f"system: {h_prompt['system']}\nuser: {user_msg}\nassistant:"
 
         prompts.append(prompt_text)
 
@@ -252,28 +281,70 @@ def format_rewriter_prompt(
     question: str,
     options: Dict[str, str],
     plan: Dict[str, Any],
+    rewriting_prompt_version: str = "v6",
 ) -> List[Dict[str, str]]:
     """Format a rewriter prompt as chat messages for TRL.
 
     Args:
-        question: The medical question text.
+        question: The question text.
         options: Dict of option labels to option text.
         plan: Plan dict from the frozen planner.
+        rewriting_prompt_version: Version key into REWRITING_PROMPTS.
 
     Returns:
         List of chat message dicts (system + user).
     """
+    r_prompt = REWRITING_PROMPTS[rewriting_prompt_version]
     options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
-    plan_json = json.dumps(plan, indent=2, ensure_ascii=False)
 
-    user_msg = REWRITER_GRPO_PROMPT.format(
+    # Provide all possible format variables (extras are silently ignored)
+    user_msg = r_prompt["user"].format(
         question=question,
         options=options_text,
-        plan_json=plan_json,
+        best_guess=plan.get("best_guess", ""),
+        reasoning=plan.get("reasoning", ""),
+        confirming_evidence=_format_list(plan.get("confirming_evidence", [])),
+        discriminating_features=_format_list(plan.get("discriminating_features", [])),
+        alternative_if_wrong=plan.get("alternative_if_wrong", ""),
     )
 
     return [
-        {"role": "system", "content": REWRITER_SYSTEM_PROMPT},
+        {"role": "system", "content": r_prompt["system"]},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+def _format_list(value) -> str:
+    """Normalize list fields from plan JSON to human-readable string."""
+    if isinstance(value, list):
+        return "; ".join(str(v) for v in value)
+    return str(value) if value else ""
+
+
+def format_hypothesis_prompt(
+    question: str,
+    options: Dict[str, str],
+    hypothesis_prompt_version: str = "v6",
+) -> List[Dict[str, str]]:
+    """Format a hypothesis/plan prompt as chat messages for TRL.
+
+    Args:
+        question: The question text.
+        options: Dict of option labels to option text.
+        hypothesis_prompt_version: Version key into HYPOTHESIS_PROMPTS.
+
+    Returns:
+        List of chat message dicts (system + user).
+    """
+    h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt_version]
+    options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
+    user_msg = h_prompt["user"].format(
+        question=question,
+        options=options_text,
+    )
+
+    return [
+        {"role": "system", "content": h_prompt["system"]},
         {"role": "user", "content": user_msg},
     ]
 
@@ -288,6 +359,8 @@ def build_grpo_dataset(
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
     hypothesis_temperature: float = 0.0,
+    hypothesis_prompt_version: str = "v6",
+    rewriting_prompt_version: str = "v6",
 ):
     """Build a HuggingFace Dataset for GRPO training.
 
@@ -339,13 +412,17 @@ def build_grpo_dataset(
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         hypothesis_temperature=hypothesis_temperature,
+        hypothesis_prompt_version=hypothesis_prompt_version,
     )
 
     # Build dataset rows
     rows = []
     for qid, q_data in zip(question_ids, questions):
         plan = plans.get(qid, {})
-        prompt = format_rewriter_prompt(q_data["question"], q_data["options"], plan)
+        prompt = format_rewriter_prompt(
+            q_data["question"], q_data["options"], plan,
+            rewriting_prompt_version=rewriting_prompt_version,
+        )
         gold = q_data.get("answer_idx", q_data.get("answer", ""))
 
         rows.append({
@@ -358,4 +435,58 @@ def build_grpo_dataset(
 
     dataset = Dataset.from_list(rows)
     print(f"✓ Built GRPO dataset: {len(dataset)} examples")
+    return dataset
+
+
+def build_hypothesis_grpo_dataset(
+    benchmark_path: Optional[str] = None,
+    split: str = "medqa",
+    max_questions: Optional[int] = None,
+    hypothesis_prompt_version: str = "v6",
+) -> Any:
+    """Build a HuggingFace Dataset for GRPO training of hypothesis generation.
+
+    Each row contains:
+        - prompt: chat messages (system + user) with the plan/hypothesis task
+        - gold_answer: correct answer letter
+        - question_id: question identifier
+        - question: original question text
+        - options: original options dict (JSON string)
+
+    Args:
+        benchmark_path: Path to benchmark.json.
+        split: Dataset split.
+        max_questions: Limit number of questions (for dry runs).
+
+    Returns:
+        datasets.Dataset
+    """
+    from datasets import Dataset
+
+    raw_data = load_medqa_benchmark(benchmark_path, split)
+    question_ids = sorted(raw_data.keys())
+
+    if max_questions is not None:
+        question_ids = question_ids[:max_questions]
+
+    questions = [raw_data[qid] for qid in question_ids]
+
+    rows = []
+    for qid, q_data in zip(question_ids, questions):
+        prompt = format_hypothesis_prompt(
+            q_data["question"], q_data["options"],
+            hypothesis_prompt_version=hypothesis_prompt_version,
+        )
+        gold = q_data.get("answer_idx", q_data.get("answer", ""))
+
+        rows.append({
+            "prompt": prompt,
+            "gold_answer": gold,
+            "question_id": qid,
+            "question": q_data["question"],
+            "options": json.dumps(q_data["options"], ensure_ascii=False),
+        })
+
+    dataset = Dataset.from_list(rows)
+    print(f"✓ Built hypothesis GRPO dataset: {len(dataset)} examples")
     return dataset
