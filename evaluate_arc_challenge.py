@@ -301,7 +301,7 @@ class ARCChallengeDataset:
     
     def __init__(self, benchmark_path: Optional[str] = None):
         if benchmark_path is None:
-            benchmark_path = "/root/HypothesisRAG/data/arc_challenge_train.json"
+            benchmark_path = os.path.join(os.path.dirname(__file__), "data", "arc_challenge_train.json")
             
         if not os.path.exists(benchmark_path):
             raise FileNotFoundError(f"{benchmark_path} not found")
