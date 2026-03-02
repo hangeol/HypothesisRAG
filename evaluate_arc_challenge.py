@@ -35,8 +35,8 @@ from retriever import create_retriever
 
 RETRIEVAL_DATASET_TO_CORPUS = {
     "textbooks": "Textbooks",
-    "pubmed": "PubMed",
     "wikipedia": "Wikipedia",
+    "arc_corpus": "arc_corpus",
 }
 CORPUS_TO_RETRIEVAL_DATASET = {
     corpus.lower(): dataset for dataset, corpus in RETRIEVAL_DATASET_TO_CORPUS.items()
@@ -301,7 +301,7 @@ class ARCChallengeDataset:
     
     def __init__(self, benchmark_path: Optional[str] = None):
         if benchmark_path is None:
-            benchmark_path = os.path.join(os.path.dirname(__file__), "data", "arc_challenge_train.json")
+            benchmark_path = os.path.join(os.path.dirname(__file__), "data", "arc_challenge_test.json")
             
         if not os.path.exists(benchmark_path):
             raise FileNotFoundError(f"{benchmark_path} not found")
@@ -309,7 +309,9 @@ class ARCChallengeDataset:
         with open(benchmark_path, 'r', encoding='utf-8') as f:
             benchmark = json.load(f)
         
-        self.dataset = benchmark["arc_challenge_train"]
+        # Auto-detect the top-level key (e.g., "arc_challenge_test" or "arc_challenge_train")
+        dataset_key = list(benchmark.keys())[0]
+        self.dataset = benchmark[dataset_key]
         self.index = sorted(self.dataset.keys())
         print(f"✓ Loaded {len(self)} ARC Challenge questions")
     
