@@ -15,11 +15,13 @@ corpus_names = {
     "Wikipedia": ["wikipedia"],
     "MedText": ["textbooks", "statpearls"],
     "MedCorp": ["pubmed", "textbooks", "statpearls", "wikipedia"],
+    "arc_corpus": ["arc_corpus"],
 }
 
 retriever_names = {
     "BM25": ["bm25"],
     "Contriever": ["facebook/contriever"],
+    "contriever": ["facebook/contriever"],
     "SPECTER": ["allenai/specter"],
     "MedCPT": ["ncbi/MedCPT-Query-Encoder"],
     "RRF-2": ["bm25", "ncbi/MedCPT-Query-Encoder"],
@@ -349,8 +351,10 @@ class DocExtracter:
                         for i, line in enumerate(open(os.path.join(self.db_dir, corpus, "chunk", fname)).read().strip().split('\n')):
                             item = json.loads(line)
                             _ = item.pop("contents", None)
-                            # assert item["id"] not in self.dict
-                            self.dict[item["id"]] = item
+                            if "id" in item:
+                                self.dict[item["id"]] = item
+                            pseudo_id = f'{fname.replace(".jsonl", "")}_{i}'
+                            self.dict[pseudo_id] = item
                 with open(os.path.join(self.db_dir, "_".join([corpus_name, "id2text.json"])), 'w') as f:
                     json.dump(self.dict, f)
         else:
@@ -364,8 +368,11 @@ class DocExtracter:
                             continue
                         for i, line in enumerate(open(os.path.join(self.db_dir, corpus, "chunk", fname)).read().strip().split('\n')):
                             item = json.loads(line)
-                            # assert item["id"] not in self.dict
-                            self.dict[item["id"]] = {"fpath": os.path.join(corpus, "chunk", fname), "index": i}
+                            path_info = {"fpath": os.path.join(corpus, "chunk", fname), "index": i}
+                            if "id" in item:
+                                self.dict[item["id"]] = path_info
+                            pseudo_id = f'{fname.replace(".jsonl", "")}_{i}'
+                            self.dict[pseudo_id] = path_info
                 with open(os.path.join(self.db_dir, "_".join([corpus_name, "id2path.json"])), 'w') as f:
                     json.dump(self.dict, f, indent=4)
         print("Initialization finished!")

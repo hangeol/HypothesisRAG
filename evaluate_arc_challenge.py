@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-ARC Challenge Evaluation for RAG Comparison Experiment (Async Parallel Version)
+MedQA Evaluation v2 – Prompt-Selectable Ablation System
 
-This script evaluates different RAG modes on ARC Challenge testset
-with maximum async parallel execution for fastest processing.
+Modes:
+  cot       : Chain-of-Thought (no RAG)
+  direct    : 1 query × total_docs
+  baseline  : 5 sub-queries × (total_docs/5)
+  hypothesis: Hypothesis→Rewrite→Retrieve→Answer (4-phase batch)
 
-Evaluation Modes:
-- cot: Chain-of-Thought baseline (no RAG, just LLM reasoning)
-- direct: 1 query × total_docs documents
-- baseline: 5 queries × (total_docs/5) documents per query
-- planning_v4: 3 queries × (total_docs/3) documents per query
-All RAG modes retrieve the same total number of documents (default: 15)
+For hypothesis mode, select prompt versions:
+  --hypothesis-prompt  v1 | v2 | v3
+  --rewriting-prompt   v1 | v2 | v3
+  --generator-prompt   v1 | v2
+  --run-all  runs all 9 hypothesis×rewriting combos (generator=v1)
 """
 
 import os
@@ -31,12 +33,16 @@ import aiohttp
 sys.path.insert(0, os.path.dirname(__file__))
 
 from retriever import create_retriever
+from prompts import (
+    HYPOTHESIS_PROMPTS, REWRITING_PROMPTS, GENERATOR_PROMPTS,
+    MULTI_QUERY_PROMPT_5, PLANNING_PROMPT,
+    load_mirage_prompts,
+)
 
 
 RETRIEVAL_DATASET_TO_CORPUS = {
     "textbooks": "Textbooks",
-    "wikipedia": "Wikipedia",
-    "arc_corpus": "arc_corpus",
+    "pubmed": "PubMed",
 }
 CORPUS_TO_RETRIEVAL_DATASET = {
     corpus.lower(): dataset for dataset, corpus in RETRIEVAL_DATASET_TO_CORPUS.items()
@@ -53,265 +59,57 @@ def parse_retrieval_dataset(value: str) -> str:
         )
     return RETRIEVAL_DATASET_TO_CORPUS[normalized]
 
-# ============================================================================
-# Prompts from MIRAGE template.py
-# ============================================================================
-# CoT (Chain-of-Thought) - No RAG
-COT_SYSTEM_PROMPT = '''You are a helpful science expert, and your task is to answer a multi-choice science question. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
 
-# RAG (with documents)
-MIRAGE_SYSTEM_PROMPT = '''You are a helpful science expert, and your task is to answer a multi-choice science question using the relevant documents. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
+def resolve_openai_api_key() -> Optional[str]:
+    """Resolve OPENAI_API_KEY from env, with ~/.bashrc fallback."""
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
 
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'MIRAGE', 'MedRAG', 'src'))
-    from template import general_medrag_system, general_cot_system
-    MIRAGE_SYSTEM_PROMPT = general_medrag_system
-    COT_SYSTEM_PROMPT = general_cot_system
+    bashrc_path = os.path.expanduser("~/.bashrc")
+    if not os.path.exists(bashrc_path):
+        return None
+
+    try:
+        text = open(bashrc_path, "r", encoding="utf-8").read()
+    except Exception:
+        return None
+
+    patterns = [
+        r'export\s+OPENAI_API_KEY\s*=\s*"([^"]+)"',
+        r"export\s+OPENAI_API_KEY\s*=\s*'([^']+)'",
+        r"export\s+OPENAI_API_KEY\s*=\s*([^\s#]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).strip()
+    return None
+
+# Load MIRAGE prompts (overrides defaults in prompts.py if available)
+if load_mirage_prompts():
     print("✓ Loaded MIRAGE prompts from template.py")
-except ImportError:
-    print("⚠ Using built-in MIRAGE prompts")
+else:
+    print("⚠ Using built-in prompts")
+
+# Re-import after potential override
+from prompts import COT_SYSTEM_PROMPT, MIRAGE_SYSTEM_PROMPT
 
 
 # ============================================================================
-# Multi-Query Rewriting Prompt (5 queries version)
+# MedQA Dataset Loader
 # ============================================================================
-MULTI_QUERY_PROMPT_5 = """You are an AI language model assistant. Your task
-is to generate exactly five different versions of the
-given user question to retrieve relevant documents
-from a vector database. By generating multiple
-perspectives on the user question, your goal is to
-help the user overcome some of the limitations of
-the distance-based similarity search.
-Original question: {query}
-Format your response in plain text as:
-Sub-query 1:
-Sub-query 2:
-Sub-query 3:
-Sub-query 4:
-Sub-query 5:"""
-
-PLANNING_PROMPT = """Analyze the following science question and extract key information.
-
-Question: {question}
-
-Extract:
-1. observed_features: List 3-7 key phenomena, findings, or conditions mentioned
-2. must_check_cooccurrence: List pairs of features whose co-occurrence is important
-3. need_disambiguation: List any confusing concepts that need distinction
-
-Output in JSON format:
-{{"observed_features": [...], "must_check_cooccurrence": [[...]], "need_disambiguation": [...]}}"""
-
-# ============================================================================
-# IMPROVED Planning V2 Prompts
-# ============================================================================
-PLANNING_V2_PROMPT = """You are a science expert. Analyze this science question and provide a scientific reasoning plan.
-
-Question: {question}
-
-Options:
-{options}
-
-Provide your analysis in JSON format:
-{{
-    "key_scientific_features": ["list 3-5 most important scientific clues from the question"],
-    "primary_hypothesis": "most likely hypothesis based on the features",
-    "alternative_hypotheses": ["2-3 alternative diagnoses to consider"],
-    "distinguishing_features": ["specific findings that would differentiate between diagnoses"],
-    "search_strategy": "brief explanation of what information would be most helpful to find"
-}}"""
-
-PLANNING_V2_QUERY_PROMPT = """Based on the clinical analysis, generate 5 specific medical search queries to find evidence.
-
-Clinical Question: {question}
-
-Analysis:
-- Key Features: {key_features}
-- Primary Hypothesis: {primary_hypothesis}
-- Differential Diagnoses: {alternatives}
-- Distinguishing Features: {distinguishing}
-
-Generate 5 targeted queries that will help differentiate between the diagnoses:
-Query 1: Search for the PRIMARY hypothesis with key phenomena
-Query 2: Search for DIFFERENTIAL hypothesis comparison
-Query 3: Search for DISTINGUISHING lab/imaging/scientific findings
-Query 4: Search for PATHOPHYSIOLOGY of the most likely condition
-Query 5: Search for TREATMENT or MANAGEMENT approach
-
-Format:
-Query 1: [your query]
-Query 2: [your query]
-Query 3: [your query]
-Query 4: [your query]
-Query 5: [your query]"""
-
-# ============================================================================
-# IMPROVED Planning V3 Prompts - Adaptive Query Generation
-# ============================================================================
-PLANNING_V3_PROMPT = """You are an expert science expert. Analyze this science question and create a focused scientific plan.
-
-Question: {question}
-
-Options:
-{options}
-
-Provide your analysis in JSON format:
-{{
-    "question_type": "factual|diagnostic|mechanism|treatment|comparison",
-    "complexity": "simple|moderate|complex",
-    "key_scientific_clues": ["list 2-4 most critical scientific findings"],
-    "most_likely_answer": "A/B/C/D with brief reasoning",
-    "confidence": "high|medium|low",
-    "what_evidence_needed": ["list specific information that would confirm the answer"],
-    "differential_if_uncertain": ["only if confidence is low, list alternatives to consider"]
-}}
-
-Be concise and focused. Identify the most discriminating features."""
-
-PLANNING_V3_QUERY_PROMPT = """You are a scientific search expert. Generate the MINIMUM number of highly specific search queries needed to answer this question.
-
-Question: {question}
-
-Analysis:
-- Question Type: {question_type}
-- Complexity: {complexity}
-- Key Clues: {key_clues}
-- Most Likely Answer: {likely_answer}
-- Evidence Needed: {evidence_needed}
-{differential_section}
-
-IMPORTANT RULES:
-1. Generate ONLY the queries that are truly necessary (minimum 2, maximum 7)
-2. Each query must be highly specific and targeted
-3. For simple/factual questions, 2-3 queries are enough
-4. For complex alternative hypotheses, use 4-6 queries
-5. DO NOT generate redundant or overlapping queries
-
-Generate your queries (only as many as needed):
-Query 1: [essential query for the most likely answer]
-Query 2: [query to verify/distinguish]
-... (add more only if necessary)"""
-
-# ============================================================================
-# Planning V4: Answer-Focused Approach with Evidence Verification
-# ============================================================================
-PLANNING_V4_PROMPT = """You are an expert science expert taking a science exam.
-
-Question: {question}
-
-Options:
-{options}
-
-Step 1: Identify the KEY DISCRIMINATING FEATURES that distinguish between the options.
-Step 2: Make your BEST GUESS for the answer based on scientific knowledge.
-Step 3: Identify what SPECIFIC EVIDENCE would CONFIRM your answer.
-
-Output in JSON:
-{{
-    "discriminating_features": ["2-3 features that distinguish between options"],
-    "best_guess": "A/B/C/D",
-    "reasoning": "brief explanation why this is the best answer",
-    "confirming_evidence": ["1-3 specific facts that would confirm this answer"],
-    "alternative_if_wrong": "A/B/C/D - only if uncertain"
-}}"""
-
-PLANNING_V4_QUERY_PROMPT = """Generate 3 highly targeted search queries to find evidence for this science question.
-
-Question: {question}
-Best Guess Answer: {best_guess}
-Reasoning: {reasoning}
-Evidence Needed: {confirming_evidence}
-Key Features: {discriminating_features}
-
-Generate 3 SPECIFIC queries:
-Query 1: Find evidence supporting {best_guess} - focus on the main reasoning
-Query 2: Find distinguishing criteria for alternative hypotheses  
-Query 3: Find specific scientific/factual features
-
-Format:
-Query 1: [query]
-Query 2: [query]
-Query 3: [query]"""
-
-# ============================================================================
-# Planning V6: Dual Hypothesis Testing Approach
-# ============================================================================
-PLANNING_V6_PROMPT = """You are an expert science expert. Analyze this question using alternative hypothesis approach.
-
-Question: {question}
-
-Options:
-{options}
-
-Generate TWO most likely diagnostic hypotheses and plan how to verify each:
-
-Output in JSON:
-{{
-    "hypothesis_1": {{
-        "hypothesis": "Most likely answer (A/B/C/D)",
-        "key_reasoning": "Why this is most likely",
-        "supporting_features": ["2-3 scientific features that support this"],
-        "evidence_to_verify": ["Specific evidence that would confirm this hypothesis"]
-    }},
-    "hypothesis_2": {{
-        "hypothesis": "Second most likely answer (A/B/C/D)",
-        "key_reasoning": "Why this is also possible",
-        "supporting_features": ["2-3 scientific features that support this"],
-        "evidence_to_verify": ["Specific evidence that would confirm this hypothesis"]
-    }},
-    "discriminating_criteria": ["Key findings that distinguish between hypothesis 1 and 2"]
-}}"""
-
-PLANNING_V6_QUERY_PROMPT = """Generate 5-6 targeted search queries to verify both hypotheses.
-
-Question: {question}
-
-Hypothesis 1: {h1_hypothesis}
-- Reasoning: {h1_reasoning}
-- Evidence needed: {h1_evidence}
-
-Hypothesis 2: {h2_hypothesis}
-- Reasoning: {h2_reasoning}
-- Evidence needed: {h2_evidence}
-
-Discriminating criteria: {discriminating}
-
-Generate 5-6 queries:
-Query 1: Evidence for Hypothesis 1
-Query 2: Evidence for Hypothesis 2
-Query 3: Distinguishing features between H1 and H2
-Query 4: Confirming underlying principles/mechanism
-Query 5: Clinical presentation comparison
-Query 6 (optional): Differences in underlying principles
-
-Format:
-Query 1: [query]
-Query 2: [query]
-Query 3: [query]
-Query 4: [query]
-Query 5: [query]
-Query 6: [query if needed]"""""
-
-
-# ============================================================================
-# ARC Challenge Dataset Loader
-# ============================================================================
-class ARCChallengeDataset:
-    """ARC Challenge Dataset loader"""
+class ArcChallengeDataset:
+    """Arc Challenge Dataset loader"""
     
     def __init__(self, benchmark_path: Optional[str] = None):
         if benchmark_path is None:
             benchmark_path = os.path.join(os.path.dirname(__file__), "data", "arc_challenge_test.json")
             
-        if not os.path.exists(benchmark_path):
-            raise FileNotFoundError(f"{benchmark_path} not found")
-        
         with open(benchmark_path, 'r', encoding='utf-8') as f:
             benchmark = json.load(f)
         
-        # Auto-detect the top-level key (e.g., "arc_challenge_test" or "arc_challenge_train")
-        dataset_key = list(benchmark.keys())[0]
-        self.dataset = benchmark[dataset_key]
+        self.dataset = benchmark["arc_challenge_test"]
         self.index = sorted(self.dataset.keys())
         print(f"✓ Loaded {len(self)} ARC Challenge questions")
     
@@ -424,13 +222,18 @@ class AsyncOpenAIClient:
         model: str = "gpt-4o-mini",
         max_concurrent: int = 100,
         max_retries: int = 3,
+        api_base: Optional[str] = None,
     ):
         self.api_key = api_key
         self.model = model
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
         self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self._is_local = bool(api_base)
+        if api_base:
+            self.base_url = api_base.rstrip('/') + '/chat/completions'
+        else:
+            self.base_url = "https://api.openai.com/v1/chat/completions"
     
     async def chat_completion(
         self,
@@ -449,8 +252,17 @@ class AsyncOpenAIClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": 2048,
         }
+
+        # For local vLLM servers: disable Qwen3 thinking mode to avoid
+        # extremely long <think> chains that make requests take 10+ minutes.
+        if self._is_local:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         
+        # Use longer timeout for local vLLM (model inference is slower than API)
+        request_timeout = aiohttp.ClientTimeout(total=300 if self._is_local else 60)
+
         async with self.semaphore:
             for attempt in range(self.max_retries):
                 try:
@@ -458,7 +270,7 @@ class AsyncOpenAIClient:
                         self.base_url,
                         headers=headers,
                         json=payload,
-                        timeout=aiohttp.ClientTimeout(total=60),
+                        timeout=request_timeout,
                     ) as response:
                         if response.status == 200:
                             data = await response.json()
@@ -497,7 +309,7 @@ class VLLMAsyncClient:
         max_retries: int = 2,
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
-        max_tokens: int = 4096,
+        max_tokens: int = 2048,
         max_model_len: int = 8192,
         trust_remote_code: bool = True,
     ):
@@ -602,11 +414,12 @@ class AsyncRAGEvaluator:
         total_docs: int = 15,
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.9,
-        vllm_max_tokens: int = 4096,
+        vllm_max_tokens: int = 2048,
         vllm_max_concurrent: int = 1,
         vllm_max_model_len: int = 8192,
         rewriter_adapter_path: Optional[str] = None,
         rewriter_base_model: Optional[str] = None,
+        api_base: Optional[str] = None,
     ):
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
@@ -622,6 +435,7 @@ class AsyncRAGEvaluator:
                 api_key=self.api_key,
                 model=model_name,
                 max_concurrent=max_concurrent,
+                api_base=api_base,
             )
         elif self.llm_provider == "vllm":
             self.client = VLLMAsyncClient(
@@ -635,30 +449,47 @@ class AsyncRAGEvaluator:
         else:
             raise ValueError(f"Unsupported llm_provider: {llm_provider}")
 
-        # GRPO-trained rewriter adapter (optional, for planning_v4_grpo mode)
+        # GRPO-trained rewriter (optional, for planning_v4_grpo mode)
+        # Supports both LoRA adapters and full fine-tuned checkpoints.
         self.grpo_rewriter_model = None
         self.grpo_rewriter_tokenizer = None
         if rewriter_adapter_path:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            from peft import PeftModel
 
             base_name = rewriter_base_model or model_name
-            print(f"Loading GRPO rewriter adapter from {rewriter_adapter_path}...")
-            self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
-                base_name, trust_remote_code=True
-            )
-            if self.grpo_rewriter_tokenizer.pad_token is None:
-                self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
-            base_model = AutoModelForCausalLM.from_pretrained(
-                base_name, torch_dtype=torch.bfloat16,
-                device_map="auto", trust_remote_code=True,
-            )
-            self.grpo_rewriter_model = PeftModel.from_pretrained(
-                base_model, rewriter_adapter_path
-            )
-            self.grpo_rewriter_model.eval()
-            print(f"✓ GRPO rewriter adapter loaded (base: {base_name})")
+            is_lora = os.path.exists(os.path.join(rewriter_adapter_path, "adapter_config.json"))
+
+            if is_lora:
+                from peft import PeftModel
+                print(f"Loading GRPO rewriter LoRA adapter from {rewriter_adapter_path}...")
+                self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
+                    base_name, trust_remote_code=True
+                )
+                if self.grpo_rewriter_tokenizer.pad_token is None:
+                    self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
+                base_m = AutoModelForCausalLM.from_pretrained(
+                    base_name, torch_dtype=torch.bfloat16,
+                    device_map="auto", trust_remote_code=True,
+                )
+                self.grpo_rewriter_model = PeftModel.from_pretrained(
+                    base_m, rewriter_adapter_path
+                )
+                self.grpo_rewriter_model.eval()
+                print(f"✓ GRPO rewriter LoRA adapter loaded (base: {base_name})")
+            else:
+                print(f"Loading GRPO rewriter full checkpoint from {rewriter_adapter_path}...")
+                self.grpo_rewriter_tokenizer = AutoTokenizer.from_pretrained(
+                    rewriter_adapter_path, trust_remote_code=True
+                )
+                if self.grpo_rewriter_tokenizer.pad_token is None:
+                    self.grpo_rewriter_tokenizer.pad_token = self.grpo_rewriter_tokenizer.eos_token
+                self.grpo_rewriter_model = AutoModelForCausalLM.from_pretrained(
+                    rewriter_adapter_path, torch_dtype=torch.bfloat16,
+                    device_map="auto", trust_remote_code=True,
+                )
+                self.grpo_rewriter_model.eval()
+                print(f"✓ GRPO rewriter full checkpoint loaded from {rewriter_adapter_path}")
         
         # Initialize retriever (sync, but fast)
         self.retriever = create_retriever(
@@ -763,16 +594,16 @@ class AsyncRAGEvaluator:
             words = re.findall(r'\b[A-Za-z]{4,}\b', question)
             queries = [
                 question,
-                f"{' '.join(words[:3])} phenomena hypothesis" if words else question,
+                f"{' '.join(words[:3])} symptoms diagnosis" if words else question,
                 f"{' '.join(words[:3])} treatment" if words else question,
                 f"{' '.join(words[1:4])} medical" if len(words) > 1 else question,
-                f"{' '.join(words[:2])} underlying principles" if len(words) > 1 else question,
+                f"{' '.join(words[:2])} pathophysiology" if len(words) > 1 else question,
             ][:self.num_subqueries]
         
         return queries
     
     # =========================================================================
-    # Planning V2: Improved scientific reasoning approach
+    # Planning V2: Improved diagnostic reasoning approach
     # =========================================================================
     async def generate_plan_v2_async(
         self,
@@ -780,12 +611,12 @@ class AsyncRAGEvaluator:
         options: Dict[str, str],
         session: aiohttp.ClientSession,
     ) -> Dict[str, Any]:
-        """Generate improved planning output with scientific reasoning"""
+        """Generate improved planning output with diagnostic reasoning"""
         options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
         prompt = PLANNING_V2_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert science expert. Provide precise, clinically-focused analysis."},
+            {"role": "system", "content": "You are an expert medical diagnostician. Provide precise, clinically-focused analysis."},
             {"role": "user", "content": prompt}
         ]
         
@@ -803,13 +634,13 @@ class AsyncRAGEvaluator:
             plan = {}
         
         # Ensure required fields exist
-        if not plan.get("key_scientific_features"):
+        if not plan.get("key_clinical_features"):
             words = re.findall(r'\b[A-Za-z]{4,}\b', question)
-            plan["key_scientific_features"] = words[:5] if words else ["symptom"]
-        if not plan.get("primary_hypothesis"):
-            plan["primary_hypothesis"] = "unknown condition"
-        if not plan.get("alternative_hypotheses"):
-            plan["alternative_hypotheses"] = []
+            plan["key_clinical_features"] = words[:5] if words else ["symptom"]
+        if not plan.get("primary_diagnosis_hypothesis"):
+            plan["primary_diagnosis_hypothesis"] = "unknown condition"
+        if not plan.get("differential_diagnoses"):
+            plan["differential_diagnoses"] = []
         if not plan.get("distinguishing_features"):
             plan["distinguishing_features"] = []
         
@@ -821,23 +652,23 @@ class AsyncRAGEvaluator:
         plan: Dict[str, Any],
         session: aiohttp.ClientSession,
     ) -> List[str]:
-        """Generate targeted queries based on the scientific plan"""
+        """Generate targeted queries based on the diagnostic plan"""
         
-        key_features = ", ".join(plan.get("key_scientific_features", [])[:5])
-        primary_hypothesis = plan.get("primary_hypothesis", "unknown")
-        alternatives = ", ".join(plan.get("alternative_hypotheses", [])[:3])
+        key_features = ", ".join(plan.get("key_clinical_features", [])[:5])
+        primary_diagnosis = plan.get("primary_diagnosis_hypothesis", "unknown")
+        differentials = ", ".join(plan.get("differential_diagnoses", [])[:3])
         distinguishing = ", ".join(plan.get("distinguishing_features", [])[:3])
         
         prompt = PLANNING_V2_QUERY_PROMPT.format(
             question=question,
             key_features=key_features,
-            primary_hypothesis=primary_hypothesis,
-            alternatives=alternatives,
+            primary_diagnosis=primary_diagnosis,
+            differentials=differentials,
             distinguishing=distinguishing
         )
         
         messages = [
-            {"role": "system", "content": "You are a scientific information retrieval expert. Generate precise, targeted search queries."},
+            {"role": "system", "content": "You are a medical information retrieval expert. Generate precise, targeted search queries."},
             {"role": "user", "content": prompt}
         ]
         
@@ -856,11 +687,11 @@ class AsyncRAGEvaluator:
         # Fallback if parsing fails
         if len(queries) < 3:
             queries = [
-                f"{primary_hypothesis} {key_features}",
-                f"{primary_hypothesis} vs {alternatives} alternative hypotheses",
-                f"{distinguishing} scientific criteria",
-                f"{primary_hypothesis} underlying principles mechanism",
-                f"{primary_hypothesis} relevant principles",
+                f"{primary_diagnosis} {key_features}",
+                f"{primary_diagnosis} vs {differentials} differential diagnosis",
+                f"{distinguishing} diagnostic criteria",
+                f"{primary_diagnosis} pathophysiology mechanism",
+                f"{primary_diagnosis} treatment management",
             ][:5]
         
         return queries[:5]
@@ -879,7 +710,7 @@ class AsyncRAGEvaluator:
         prompt = PLANNING_V3_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert science expert. Be concise and precise."},
+            {"role": "system", "content": "You are an expert medical diagnostician. Be concise and precise."},
             {"role": "user", "content": prompt}
         ]
         
@@ -899,16 +730,16 @@ class AsyncRAGEvaluator:
         # Ensure required fields exist with defaults
         plan.setdefault("question_type", "diagnostic")
         plan.setdefault("complexity", "moderate")
-        plan.setdefault("key_scientific_clues", [])
+        plan.setdefault("key_clinical_clues", [])
         plan.setdefault("most_likely_answer", "")
         plan.setdefault("confidence", "medium")
         plan.setdefault("what_evidence_needed", [])
         plan.setdefault("differential_if_uncertain", [])
         
         # Fallback for key clues
-        if not plan["key_scientific_clues"]:
+        if not plan["key_clinical_clues"]:
             words = re.findall(r'\b[A-Za-z]{4,}\b', question)
-            plan["key_scientific_clues"] = words[:4] if words else ["symptom"]
+            plan["key_clinical_clues"] = words[:4] if words else ["symptom"]
         
         return plan
     
@@ -922,15 +753,15 @@ class AsyncRAGEvaluator:
         
         question_type = plan.get("question_type", "diagnostic")
         complexity = plan.get("complexity", "moderate")
-        key_clues = ", ".join(plan.get("key_scientific_clues", [])[:4])
+        key_clues = ", ".join(plan.get("key_clinical_clues", [])[:4])
         likely_answer = plan.get("most_likely_answer", "unknown")
         evidence_needed = ", ".join(plan.get("what_evidence_needed", [])[:3])
-        alternatives = plan.get("differential_if_uncertain", [])
+        differentials = plan.get("differential_if_uncertain", [])
         
         # Build differential section only if needed
         differential_section = ""
-        if alternatives and plan.get("confidence") == "low":
-            differential_section = f"- Differentials to Consider: {', '.join(alternatives[:3])}"
+        if differentials and plan.get("confidence") == "low":
+            differential_section = f"- Differentials to Consider: {', '.join(differentials[:3])}"
         
         prompt = PLANNING_V3_QUERY_PROMPT.format(
             question=question,
@@ -943,7 +774,7 @@ class AsyncRAGEvaluator:
         )
         
         messages = [
-            {"role": "system", "content": "You are a scientific search expert. Generate only essential, highly targeted queries. Quality over quantity."},
+            {"role": "system", "content": "You are a medical search expert. Generate only essential, highly targeted queries. Quality over quantity."},
             {"role": "user", "content": prompt}
         ]
         
@@ -984,7 +815,7 @@ class AsyncRAGEvaluator:
         prompt = PLANNING_V4_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert science expert. Make your best scientific guess and identify what evidence would confirm it."},
+            {"role": "system", "content": "You are an expert medical diagnostician. Make your best diagnostic guess and identify what evidence would confirm it."},
             {"role": "user", "content": prompt}
         ]
         
@@ -1058,7 +889,7 @@ class AsyncRAGEvaluator:
             queries = [
                 f"{best_guess} {discriminating_features}",
                 f"{confirming_evidence}",
-                f"{reasoning} hypothesis",
+                f"{reasoning} diagnosis",
             ]
         
         return queries[:5]  # Cap at 5
@@ -1078,10 +909,10 @@ class AsyncRAGEvaluator:
         Call via asyncio.loop.run_in_executor() when inside an async context.
         """
         if self.grpo_rewriter_model is None:
-            raise RuntimeError("GRPO rewriter not loaded. Use --rewriter-adapter-path.")
+            raise RuntimeError("GRPO rewriter not loaded. Use --rewriter-checkpoint.")
         
         import torch
-        from data.arc_challenge_loader import format_rewriter_prompt
+        from data.medqa_loader import format_rewriter_prompt
         from training.reward import parse_queries_from_completion
         
         messages = format_rewriter_prompt(question, options, plan)
@@ -1117,7 +948,7 @@ class AsyncRAGEvaluator:
             queries = [
                 f"{best_guess} {discriminating_features}",
                 f"{confirming_evidence}",
-                f"{plan.get('reasoning', '')} hypothesis",
+                f"{plan.get('reasoning', '')} diagnosis",
             ]
         
         return queries[:5]
@@ -1131,12 +962,12 @@ class AsyncRAGEvaluator:
         options: Dict[str, str],
         session: aiohttp.ClientSession,
     ) -> Dict[str, Any]:
-        """Generate dual hypothesis plan for alternative hypotheses"""
+        """Generate dual hypothesis plan for differential diagnosis"""
         options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
         prompt = PLANNING_V6_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert science expert. Use alternative hypotheses to generate two competing hypotheses."},
+            {"role": "system", "content": "You are an expert medical diagnostician. Use differential diagnosis to generate two competing hypotheses."},
             {"role": "user", "content": prompt}
         ]
         
@@ -1156,14 +987,14 @@ class AsyncRAGEvaluator:
         # Ensure required fields
         if "hypothesis_1" not in plan:
             plan["hypothesis_1"] = {
-                "hypothesis": "",
+                "diagnosis": "",
                 "key_reasoning": "",
                 "supporting_features": [],
                 "evidence_to_verify": []
             }
         if "hypothesis_2" not in plan:
             plan["hypothesis_2"] = {
-                "hypothesis": "",
+                "diagnosis": "",
                 "key_reasoning": "",
                 "supporting_features": [],
                 "evidence_to_verify": []
@@ -1184,11 +1015,11 @@ class AsyncRAGEvaluator:
         h1 = plan.get("hypothesis_1", {})
         h2 = plan.get("hypothesis_2", {})
         
-        h1_hypothesis = h1.get("hypothesis", "unknown")
+        h1_diagnosis = h1.get("diagnosis", "unknown")
         h1_reasoning = h1.get("key_reasoning", "")
         h1_evidence = ", ".join(h1.get("evidence_to_verify", [])[:2])
         
-        h2_hypothesis = h2.get("hypothesis", "unknown")
+        h2_diagnosis = h2.get("diagnosis", "unknown")
         h2_reasoning = h2.get("key_reasoning", "")
         h2_evidence = ", ".join(h2.get("evidence_to_verify", [])[:2])
         
@@ -1196,10 +1027,10 @@ class AsyncRAGEvaluator:
         
         prompt = PLANNING_V6_QUERY_PROMPT.format(
             question=question,
-            h1_hypothesis=h1_hypothesis,
+            h1_diagnosis=h1_diagnosis,
             h1_reasoning=h1_reasoning,
             h1_evidence=h1_evidence,
-            h2_hypothesis=h2_hypothesis,
+            h2_diagnosis=h2_diagnosis,
             h2_reasoning=h2_reasoning,
             h2_evidence=h2_evidence,
             discriminating=discriminating
@@ -1225,11 +1056,11 @@ class AsyncRAGEvaluator:
         # Fallback if parsing fails
         if len(queries) < 3:
             queries = [
-                f"{h1_hypothesis} {h1_evidence}",
-                f"{h2_hypothesis} {h2_evidence}",
-                f"{h1_hypothesis} vs {h2_hypothesis} differential",
+                f"{h1_diagnosis} {h1_evidence}",
+                f"{h2_diagnosis} {h2_evidence}",
+                f"{h1_diagnosis} vs {h2_diagnosis} differential",
                 f"{discriminating} distinguishing features",
-                f"phenomena presentation comparison",
+                f"clinical presentation comparison",
             ]
         
         return queries[:6]  # Cap at 6
@@ -1741,6 +1572,7 @@ async def run_evaluation_async(
     total_docs: int = 15,
     rewriter_adapter_path: Optional[str] = None,
     rewriter_base_model: Optional[str] = None,
+    api_base: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     
@@ -1751,7 +1583,7 @@ async def run_evaluation_async(
     os.makedirs(output_dir, exist_ok=True)
     
     print("=" * 80)
-    print("ARC Challenge Evaluation (MAX ASYNC)")
+    print("MedQA Evaluation (MAX ASYNC)")
     print("=" * 80)
     print(f"LLM provider: {llm_provider}")
     print(f"Model: {model_name}")
@@ -1772,7 +1604,7 @@ async def run_evaluation_async(
     print("=" * 80)
     
     # Load dataset
-    dataset = ARCChallengeDataset()
+    dataset = ArcChallengeDataset()
     total_questions = min(max_questions, len(dataset))
     
     # Initialize evaluator
@@ -1790,6 +1622,7 @@ async def run_evaluation_async(
         vllm_max_tokens=vllm_max_tokens,
         vllm_max_concurrent=vllm_max_concurrent,
         vllm_max_model_len=vllm_max_model_len,
+        api_base=api_base,
     )
     
     if rag_modes:
@@ -1804,7 +1637,7 @@ async def run_evaluation_async(
     
     # Create aiohttp session
     connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=max_concurrent)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=connector, headers={"Accept-Encoding": "gzip, deflate"}) as session:
         
         # Create all tasks at once
         tasks = []
@@ -1940,7 +1773,7 @@ async def run_evaluation_async(
     model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
     if not model_suffix:
         model_suffix = "model"
-    output_file = os.path.join(output_dir, f"arc_challenge_{mode_suffix}_{model_suffix}_{timestamp}.json")
+    output_file = os.path.join(output_dir, f"medqa_{mode_suffix}_{model_suffix}_{timestamp}.json")
     
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
@@ -1950,88 +1783,1166 @@ async def run_evaluation_async(
     return summary
 
 
+# ============================================================================
+# Batch-Phased Evaluation (for checkpoint evaluation)
+# ============================================================================
+# Process ALL questions per phase with full VRAM utilization.
+# Only ONE model on GPU at a time → gpu_mem=0.9, full vLLM batching.
+#
+# Each vLLM phase runs in a SEPARATE subprocess so GPU memory is
+# naturally freed when the subprocess exits. Data passes via temp files.
+#
+# Phase 1: Plan ALL questions    (base model)      [subprocess]
+# Phase 2: Rewrite ALL queries   (checkpoint model) [subprocess]
+# Phase 3: Retrieve ALL          (CPU, in-process)
+# Phase 4: Answer ALL questions  (base model)      [subprocess]
+# ============================================================================
+
+import pickle
+import tempfile
+import multiprocessing as _mp
+
+
+def _format_chat_messages(tokenizer, messages: List[Dict[str, str]]) -> str:
+    """Format chat messages into a prompt for vLLM generate()."""
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            lines.append(f"{role}: {content}")
+        lines.append("assistant:")
+        return "\n".join(lines)
+
+
+def _extract_vllm_output_texts(outputs) -> List[str]:
+    """
+    Normalize vLLM outputs (chat() or generate()) into a list of strings.
+    Supports a few return shapes across vLLM versions.
+    """
+    if outputs is None:
+        return []
+
+    if isinstance(outputs, tuple):
+        outputs = list(outputs)
+    elif not isinstance(outputs, list):
+        outputs = [outputs]
+
+    texts = []
+    for out in outputs:
+        text = ""
+        if hasattr(out, "outputs"):
+            try:
+                first = out.outputs[0]
+                if hasattr(first, "text"):
+                    text = first.text
+            except Exception:
+                text = ""
+        elif isinstance(out, dict):
+            if "choices" in out and out["choices"]:
+                choice = out["choices"][0]
+                if isinstance(choice, dict):
+                    message = choice.get("message", {})
+                    if isinstance(message, dict):
+                        text = message.get("content", "") or text
+                    else:
+                        text = choice.get("text", text)
+                else:
+                    text = getattr(choice, "text", text)
+            elif "text" in out:
+                text = out.get("text", "")
+        elif isinstance(out, str):
+            text = out
+
+        texts.append("" if text is None else str(text))
+
+    return texts
+
+
+def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
+                          output_file: str, gpu_mem: float,
+                          max_model_len: int, max_tokens: int):
+    """
+    Subprocess entry: load vLLM model, run batch chat, save outputs, exit.
+    All GPU memory is freed when this process exits.
+    """
+    from vllm import LLM, SamplingParams
+
+    # Load messages
+    with open(messages_list_file, "rb") as f:
+        messages_list = pickle.load(f)
+
+    print(f"    [subprocess] Loading model: {os.path.basename(model_path)} ...")
+    llm = LLM(
+        model=model_path,
+        gpu_memory_utilization=gpu_mem,
+        max_model_len=max_model_len,
+        trust_remote_code=True,
+        enforce_eager=True,
+    )
+
+    sampling = SamplingParams(temperature=0, max_tokens=max_tokens)
+    print(f"    [subprocess] Running batch inference on {len(messages_list)} inputs ...")
+
+    prompts = [_format_chat_messages(llm.get_tokenizer(), m) for m in messages_list]
+    try:
+        outputs = llm.chat(messages=messages_list, sampling_params=sampling)
+    except Exception:
+        outputs = llm.generate(prompts, sampling_params=sampling, use_tqdm=False)
+
+    # Extract text outputs
+    result_texts = _extract_vllm_output_texts(outputs)
+    if len(result_texts) < len(messages_list):
+        result_texts.extend([""] * (len(messages_list) - len(result_texts)))
+    if len(result_texts) != len(messages_list):
+        raise RuntimeError(
+            f"Unexpected vLLM output count: got {len(result_texts)} for {len(messages_list)} inputs"
+        )
+
+    with open(output_file, "wb") as f:
+        pickle.dump(result_texts, f)
+
+    print(f"    [subprocess] Done. Exiting to free GPU memory.")
+    # Process exit frees all GPU memory automatically
+
+
+def _run_phase_in_subprocess(model_path: str, messages_list: list,
+                             gpu_mem: float, max_model_len: int,
+                             max_tokens: int) -> list:
+    """Run a vLLM batch in a subprocess and return result texts."""
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f_in:
+        pickle.dump(messages_list, f_in)
+        input_path = f_in.name
+
+    output_path = input_path + ".out.pkl"
+
+    try:
+        p = _mp.Process(
+            target=_run_vllm_batch_phase,
+            args=(model_path, input_path, output_path,
+                  gpu_mem, max_model_len, max_tokens),
+        )
+        p.start()
+        p.join()
+
+        if p.exitcode != 0:
+            raise RuntimeError(f"vLLM subprocess failed (exit={p.exitcode})")
+
+        with open(output_path, "rb") as f:
+            return pickle.load(f)
+    finally:
+        for fp in [input_path, output_path]:
+            try:
+                os.unlink(fp)
+            except OSError:
+                pass
+
+
+def _format_list(val):
+    """Convert list or string to comma-separated string."""
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val[:5])
+    return str(val)
+
+
+async def _run_openai_batch_phase(
+    client: AsyncOpenAIClient,
+    session: aiohttp.ClientSession,
+    messages_list: List[List[Dict[str, str]]],
+    desc: str,
+) -> List[str]:
+    """Run one phase using OpenAI async client, preserving input order."""
+    if not messages_list:
+        return []
+    tasks = [
+        client.chat_completion(messages=messages, session=session)
+        for messages in messages_list
+    ]
+    return await tqdm_asyncio.gather(*tasks, desc=desc)
+
+
+async def run_batch_phased_evaluation_openai(
+    base_model: str,
+    rewriter_checkpoint: str = None,
+    hypothesis_checkpoint: str = None,
+    generator_checkpoint: str = None,
+    max_questions: int = 1273,
+    total_docs: int = 15,
+    max_tokens: int = 2048,
+    max_concurrent: int = 100,
+    output_dir: str = "outputs",
+    retriever_name: str = "MedCPT",
+    corpus_name: str = "Textbooks",
+    hypothesis_prompt: str = "v1",
+    rewriting_prompt: str = "v1",
+    generator_prompt: str = "v1",
+    api_base: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Batch-phased hypothesis evaluation via OpenAI API (GPT-compatible).
+
+    This mirrors run_batch_phased_evaluation() but uses async API calls
+    instead of vLLM subprocess inference.
+    """
+    from training.reward import (
+        parse_queries_from_completion, parse_hypothesis_plan,
+    )
+
+    api_key = resolve_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found. Set env or add export to ~/.bashrc.")
+
+    # Resolve per-module models
+    hypothesis_model = hypothesis_checkpoint or base_model
+    rewriter_model = rewriter_checkpoint or base_model
+    generator_model = generator_checkpoint or base_model
+
+    h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt]
+    r_prompt = REWRITING_PROMPTS[rewriting_prompt]
+    g_prompt = GENERATOR_PROMPTS[generator_prompt]
+    combo_tag = f"h{hypothesis_prompt}_r{rewriting_prompt}_g{generator_prompt}"
+
+    hypothesis_client = AsyncOpenAIClient(
+        api_key=api_key,
+        model=hypothesis_model,
+        max_concurrent=max_concurrent,
+        api_base=api_base,
+    )
+    rewriter_client = AsyncOpenAIClient(
+        api_key=api_key,
+        model=rewriter_model,
+        max_concurrent=max_concurrent,
+        api_base=api_base,
+    )
+    generator_client = AsyncOpenAIClient(
+        api_key=api_key,
+        model=generator_model,
+        max_concurrent=max_concurrent,
+        api_base=api_base,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load dataset
+    dataset = ArcChallengeDataset()
+    n = min(max_questions, len(dataset))
+    questions = [dataset[i] for i in range(n)]
+    print(f"\n{'='*70}")
+    print(f"Batch-Phased Evaluation (OpenAI): {n} questions")
+    print(f"Combo:        {combo_tag}")
+    print(f"  hypothesis: {h_prompt['description']}")
+    print(f"  rewriting:  {r_prompt['description']}")
+    print(f"  generator:  {g_prompt['description']}")
+    print(f"Base model:   {base_model}")
+    print(f"Hypothesis:   {hypothesis_model}"
+          f"{' (checkpoint override)' if hypothesis_checkpoint else ''}")
+    print(f"Rewriter:     {rewriter_model}"
+          f"{' (checkpoint override)' if rewriter_checkpoint else ''}")
+    print(f"Generator:    {generator_model}"
+          f"{' (checkpoint override)' if generator_checkpoint else ''}")
+    print(f"max_concurrent={max_concurrent}  max_tokens={max_tokens}")
+    if api_base:
+        print(f"api_base={api_base}")
+    print(f"{'='*70}")
+
+    t_total = time.time()
+
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrent,
+        limit_per_host=max_concurrent,
+    )
+    async with aiohttp.ClientSession(connector=connector, headers={"Accept-Encoding": "gzip, deflate"}) as session:
+        # ── Phase 1: Hypothesis ALL (OpenAI async) ──
+        print(f"\n[Phase 1/4] Generating hypotheses for {n} questions "
+              f"({hypothesis_model}) ...")
+        t1 = time.time()
+
+        plan_messages = []
+        for qd in questions:
+            options_text = "\n".join(
+                [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+            )
+            user = h_prompt["user"].format(
+                question=qd["question"],
+                options=options_text,
+            )
+            plan_messages.append([
+                {"role": "system", "content": h_prompt["system"]},
+                {"role": "user", "content": user},
+            ])
+
+        plan_texts = await _run_openai_batch_phase(
+            hypothesis_client,
+            session,
+            plan_messages,
+            desc="Phase1-Hypothesis",
+        )
+
+        plans = []
+        for idx, text in enumerate(plan_texts):
+            p = parse_hypothesis_plan(text)
+            p.setdefault("discriminating_features", [])
+            p.setdefault("best_guess", "")
+            p.setdefault("best_guess_text", "")
+            p.setdefault("reasoning", "")
+            p.setdefault("confirming_evidence", [])
+            p.setdefault("alternative_if_wrong", "")
+            if not p["discriminating_features"]:
+                words = re.findall(r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
+                p["discriminating_features"] = words[:3] or ["symptom"]
+            plans.append(p)
+
+        print(f"  ✓ Phase 1 done: {len(plans)} hypotheses "
+              f"in {time.time()-t1:.1f}s")
+
+        # ── Phase 2: Rewrite ALL (OpenAI async) ──
+        print(f"\n[Phase 2/4] Generating queries for {n} questions "
+              f"({rewriter_model}) ...")
+        t2 = time.time()
+
+        rw_messages = []
+        for i, qd in enumerate(questions):
+            p = plans[i]
+            options_text = "\n".join(
+                [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+            )
+            bg_letter = (p.get("best_guess", "") or "").strip().upper().rstrip(".")
+            bg_text = p.get("best_guess_text") or (
+                f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}"
+                if bg_letter in qd.get("options", {}) else bg_letter
+            )
+            alt_letter = (p.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
+            alt_text = (
+                f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}"
+                if alt_letter in qd.get("options", {}) else alt_letter
+            )
+            user = r_prompt["user"].format(
+                question=qd["question"],
+                options=options_text,
+                best_guess=p.get("best_guess", ""),
+                best_guess_text=bg_text,
+                reasoning=p.get("reasoning", ""),
+                confirming_evidence=_format_list(p.get("confirming_evidence", [])),
+                discriminating_features=_format_list(p.get("discriminating_features", [])),
+                alternative_if_wrong=p.get("alternative_if_wrong", ""),
+                alternative_text=alt_text,
+            )
+            rw_messages.append([
+                {"role": "system", "content": r_prompt["system"]},
+                {"role": "user", "content": user},
+            ])
+
+        rw_texts = await _run_openai_batch_phase(
+            rewriter_client,
+            session,
+            rw_messages,
+            desc="Phase2-Rewriter",
+        )
+
+        all_queries = []
+        for i, text in enumerate(rw_texts):
+            queries = parse_queries_from_completion(text)
+            if len(queries) < 2:
+                p = plans[i]
+                bg = p.get("best_guess", "")
+                cf = _format_list(p.get("confirming_evidence", []))
+                df = _format_list(p.get("discriminating_features", []))
+                queries = [f"{bg} {df}", cf, f"{p.get('reasoning', '')} diagnosis"]
+            all_queries.append(queries[:5])
+
+        print(f"  ✓ Phase 2 done: {len(all_queries)} query sets "
+              f"in {time.time()-t2:.1f}s")
+
+        # ── Phase 3: Retrieve ALL (CPU, in-process) ──
+        print(f"\n[Phase 3/4] Retrieving documents for {n} questions ...")
+        t3 = time.time()
+
+        try:
+            from retriever import create_retriever as _cr
+            retriever = _cr(
+                retriever_type="mirage",
+                retriever_name=retriever_name,
+                corpus_name=corpus_name,
+            )
+            if hasattr(retriever, "_lazy_init"):
+                retriever._lazy_init()
+        except Exception as e:
+            print(f"  WARNING: Retriever init failed: {e}")
+            retriever = None
+
+        all_docs = []
+        for i, queries in enumerate(all_queries):
+            doc_scores: Dict[str, float] = {}
+            doc_data: Dict[str, Dict[str, Any]] = {}
+            if retriever:
+                k_per = max(1, total_docs // max(len(queries), 1))
+                for q in queries:
+                    try:
+                        docs, scores = retriever.retrieve(q, k=k_per)
+                        for doc, score in zip(docs, scores):
+                            doc_id = doc.get(
+                                "id",
+                                doc.get("title", str(hash(doc.get("content", "")[:100]))),
+                            )
+                            if doc_id not in doc_scores:
+                                doc_scores[doc_id] = 0.0
+                                doc_data[doc_id] = doc.copy()
+                                doc_data[doc_id]["query_trace"] = []
+                            try:
+                                doc_scores[doc_id] += float(score)
+                            except Exception:
+                                doc_scores[doc_id] += 0.0
+                            doc_data[doc_id]["query_trace"].append(q)
+                    except Exception:
+                        pass
+
+            docs_sorted = []
+            for doc_id in sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True):
+                doc = doc_data[doc_id]
+                doc["fused_score"] = doc_scores[doc_id]
+                docs_sorted.append(doc)
+
+            all_docs.append(docs_sorted)
+            if (i + 1) % 200 == 0:
+                print(f"  ... {i+1}/{n} retrieved")
+
+        print(f"  ✓ Phase 3 done: retrieval in {time.time()-t3:.1f}s")
+
+        # Free retriever memory before phase 4
+        if retriever is not None:
+            del retriever
+        import gc
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("  ✓ Retriever memory freed")
+
+        # ── Phase 4: Answer ALL (OpenAI async) ──
+        print(f"\n[Phase 4/4] Generating answers for {n} questions "
+              f"({generator_model}) ...")
+        t4 = time.time()
+
+        ans_messages = []
+        for i, qd in enumerate(questions):
+            options_text = "\n".join(
+                [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+            )
+            docs = all_docs[i]
+            ctx = "\n\n".join(
+                [
+                    f"Document [{j+1}] (Title: {d.get('title', 'Untitled')})\n"
+                    f"{d.get('content', '')}"
+                    for j, d in enumerate(docs[:25])
+                ]
+            ) or "No documents."
+
+            fmt_vars = {
+                "context": ctx,
+                "question": qd["question"],
+                "options": options_text,
+            }
+            if generator_prompt == "v2":
+                p = plans[i]
+                fmt_vars["hypothesis_summary"] = (
+                    f"Best guess: {p.get('best_guess', '')} — {p.get('reasoning', '')}"
+                )
+                fmt_vars["queries_summary"] = "\n".join(
+                    f"  {j+1}. {q}" for j, q in enumerate(all_queries[i])
+                )
+
+            user = g_prompt["user"].format(**fmt_vars)
+            ans_messages.append([
+                {"role": "system", "content": g_prompt["system"]},
+                {"role": "user", "content": user},
+            ])
+
+        ans_texts = await _run_openai_batch_phase(
+            generator_client,
+            session,
+            ans_messages,
+            desc="Phase4-Generator",
+        )
+
+        print(f"  ✓ Phase 4 done: answers in {time.time()-t4:.1f}s")
+
+    # ── Compile Results ──
+    print(f"\n[Result] Compiling ...")
+    results = []
+    correct = 0
+    total = 0
+    for i, qd in enumerate(questions):
+        correct_answer = qd.get("answer_idx", qd.get("answer", ""))
+        raw_resp = ans_texts[i]
+        predicted = parse_answer(raw_resp)
+        is_correct = predicted.upper() == correct_answer.upper()
+        if is_correct:
+            correct += 1
+        total += 1
+        results.append({
+            "question_id": i,
+            "question": qd["question"],
+            "options": qd["options"],
+            "correct_answer": correct_answer,
+            "modes": {
+                combo_tag: {
+                    "num_queries": len(all_queries[i]),
+                    "num_docs": len(all_docs[i]),
+                    "queries": all_queries[i],
+                    "plan": plans[i],
+                    "raw_response": raw_resp,
+                    "predicted_answer": predicted,
+                    "is_correct": is_correct,
+                }
+            },
+        })
+
+    elapsed = time.time() - t_total
+    accuracy = correct / total * 100 if total > 0 else 0
+
+    summary = {
+        "config": {
+            "llm_provider": "openai",
+            "base_model": base_model,
+            "hypothesis_checkpoint": hypothesis_checkpoint,
+            "rewriter_checkpoint": rewriter_checkpoint,
+            "generator_checkpoint": generator_checkpoint,
+            "hypothesis_prompt": hypothesis_prompt,
+            "rewriting_prompt": rewriting_prompt,
+            "generator_prompt": generator_prompt,
+            "combo_tag": combo_tag,
+            "total_evaluated": total,
+            "total_docs": total_docs,
+            "max_tokens": max_tokens,
+            "max_concurrent": max_concurrent,
+            "api_base": api_base,
+        },
+        "timing": {
+            "total_seconds": elapsed,
+            "avg_per_question": elapsed / total if total else 0,
+            "questions_per_minute": total / elapsed * 60 if elapsed > 0 else 0,
+        },
+        "mode_results": {
+            combo_tag: {
+                "correct": correct,
+                "total": total,
+                "accuracy": accuracy,
+            }
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    print(f"\n{'='*70}")
+    print(f"[{combo_tag}] {accuracy:.2f}% ({correct}/{total}) "
+          f"in {elapsed:.0f}s ({summary['timing']['questions_per_minute']:.1f} q/min)")
+    print(f"{'='*70}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", base_model).strip("_")
+    if not model_suffix:
+        model_suffix = "model"
+    out_file = os.path.join(
+        output_dir,
+        f"medqa_{combo_tag}_{model_suffix}_{ts}.json",
+    )
+    with open(out_file, "w") as f:
+        json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
+    print(f"✓ Saved: {out_file}")
+
+    return {
+        "combo": combo_tag,
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "file": out_file,
+    }
+
+
+def run_batch_phased_evaluation(
+    base_model: str,
+    rewriter_checkpoint: str = None,
+    hypothesis_checkpoint: str = None,
+    generator_checkpoint: str = None,
+    max_questions: int = 1273,
+    total_docs: int = 15,
+    gpu_mem: float = 0.9,
+    max_model_len: int = 8192,
+    max_tokens: int = 2048,
+    output_dir: str = "outputs",
+    retriever_name: str = "MedCPT",
+    corpus_name: str = "Textbooks",
+    hypothesis_prompt: str = "v1",
+    rewriting_prompt: str = "v1",
+    generator_prompt: str = "v1",
+) -> Dict[str, Any]:
+    """
+    Batch-phased evaluation with selectable prompts.
+    Each vLLM phase runs in a separate subprocess → full GPU memory release.
+
+    Args:
+        hypothesis_prompt: "v1", "v2", or "v3" (from prompts.py)
+        rewriting_prompt:  "v1", "v2", or "v3" (from prompts.py)
+        generator_prompt:  "v1" or "v2"        (from prompts.py)
+    """
+    from training.reward import (
+        parse_queries_from_completion, parse_hypothesis_plan,
+    )
+
+    # Resolve per-module models
+    hypothesis_model = hypothesis_checkpoint or base_model
+    rewriter_model = rewriter_checkpoint or base_model
+    generator_model = generator_checkpoint or base_model
+
+    h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt]
+    r_prompt = REWRITING_PROMPTS[rewriting_prompt]
+    g_prompt = GENERATOR_PROMPTS[generator_prompt]
+    combo_tag = f"h{hypothesis_prompt}_r{rewriting_prompt}_g{generator_prompt}"
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load dataset
+    dataset = ArcChallengeDataset()
+    n = min(max_questions, len(dataset))
+    questions = [dataset[i] for i in range(n)]
+    print(f"\n{'='*70}")
+    print(f"Batch-Phased Evaluation: {n} questions")
+    print(f"Combo:        {combo_tag}")
+    print(f"  hypothesis: {h_prompt['description']}")
+    print(f"  rewriting:  {r_prompt['description']}")
+    print(f"  generator:  {g_prompt['description']}")
+    print(f"Base model:   {base_model}")
+    print(f"Hypothesis:   {hypothesis_model}"
+          f"{' (checkpoint)' if hypothesis_checkpoint else ''}")
+    print(f"Rewriter:     {rewriter_model}"
+          f"{' (checkpoint)' if rewriter_checkpoint else ''}")
+    print(f"Generator:    {generator_model}"
+          f"{' (checkpoint)' if generator_checkpoint else ''}")
+    print(f"gpu_mem={gpu_mem}  max_model_len={max_model_len}  "
+          f"max_tokens={max_tokens}")
+    print(f"{'='*70}")
+
+    t_total = time.time()
+
+    # ── Phase 1: Hypothesis ALL (subprocess) ──
+    print(f"\n[Phase 1/4] Generating hypotheses for {n} questions "
+          f"({os.path.basename(hypothesis_model)}) ...")
+    t1 = time.time()
+
+    plan_messages = []
+    for qd in questions:
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        user = h_prompt["user"].format(
+            question=qd["question"], options=options_text)
+        plan_messages.append([
+            {"role": "system", "content": h_prompt["system"]},
+            {"role": "user", "content": user},
+        ])
+
+    plan_texts = _run_phase_in_subprocess(
+        hypothesis_model, plan_messages, gpu_mem, max_model_len, max_tokens)
+
+    plans = []
+    for idx, text in enumerate(plan_texts):
+        p = parse_hypothesis_plan(text)
+        p.setdefault("discriminating_features", [])
+        p.setdefault("best_guess", "")
+        p.setdefault("reasoning", "")
+        p.setdefault("confirming_evidence", [])
+        p.setdefault("alternative_if_wrong", "")
+        if not p["discriminating_features"]:
+            words = re.findall(
+                r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
+            p["discriminating_features"] = words[:3] or ["symptom"]
+        plans.append(p)
+
+    print(f"  ✓ Phase 1 done: {len(plans)} hypotheses "
+          f"in {time.time()-t1:.1f}s")
+
+    # ── Phase 2: Rewrite ALL (rewriter model, subprocess) ──
+    print(f"\n[Phase 2/4] Generating queries for {n} questions "
+          f"({os.path.basename(rewriter_model)}) ...")
+    t2 = time.time()
+
+    rw_messages = []
+    for i, qd in enumerate(questions):
+        p = plans[i]
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        # Expand best_guess letter to include option text (e.g. "A" -> "A. Psoriasis")
+        bg_letter = (p.get("best_guess", "") or "").strip().upper().rstrip(".")
+        # Prefer model-generated best_guess_text (hv7+), fall back to code expansion
+        bg_text = p.get("best_guess_text") or (
+            f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}" if bg_letter in qd.get('options', {}) else bg_letter
+        )
+        alt_letter = (p.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
+        alt_text = f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}" if alt_letter in qd.get('options', {}) else alt_letter
+        user = r_prompt["user"].format(
+            question=qd["question"],
+            options=options_text,
+            best_guess=p.get("best_guess", ""),
+            best_guess_text=bg_text,
+            reasoning=p.get("reasoning", ""),
+            confirming_evidence=_format_list(
+                p.get("confirming_evidence", [])),
+            discriminating_features=_format_list(
+                p.get("discriminating_features", [])),
+            alternative_if_wrong=p.get("alternative_if_wrong", ""),
+            alternative_text=alt_text,
+        )
+        rw_messages.append([
+            {"role": "system", "content": r_prompt["system"]},
+            {"role": "user", "content": user},
+        ])
+
+    rw_texts = _run_phase_in_subprocess(
+        rewriter_model, rw_messages, gpu_mem, max_model_len, max_tokens)
+
+    all_queries = []
+    for i, text in enumerate(rw_texts):
+        queries = parse_queries_from_completion(text)
+        if len(queries) < 2:
+            p = plans[i]
+            bg = p.get("best_guess", "")
+            cf = _format_list(p.get("confirming_evidence", []))
+            df = _format_list(p.get("discriminating_features", []))
+            queries = [f"{bg} {df}", cf,
+                       f"{p.get('reasoning','')} diagnosis"]
+        all_queries.append(queries[:5])
+
+    print(f"  ✓ Phase 2 done: {len(all_queries)} query sets "
+          f"in {time.time()-t2:.1f}s")
+
+    # ── Phase 3: Retrieve ALL (CPU, in-process) ──
+    print(f"\n[Phase 3/4] Retrieving documents for {n} questions ...")
+    t3 = time.time()
+
+    try:
+        from retriever import create_retriever as _cr
+        retriever = _cr(
+            retriever_type="mirage",
+            retriever_name=retriever_name,
+            corpus_name=corpus_name,
+        )
+        if hasattr(retriever, "_lazy_init"):
+            retriever._lazy_init()
+    except Exception as e:
+        print(f"  WARNING: Retriever init failed: {e}")
+        retriever = None
+
+    all_docs = []
+    for i, queries in enumerate(all_queries):
+        doc_scores: Dict[str, float] = {}
+        doc_data: Dict[str, Dict[str, Any]] = {}
+        if retriever:
+            k_per = max(1, total_docs // max(len(queries), 1))
+            for q in queries:
+                try:
+                    docs, scores = retriever.retrieve(q, k=k_per)
+                    for doc, score in zip(docs, scores):
+                        doc_id = doc.get(
+                            "id",
+                            doc.get("title",
+                                    str(hash(doc.get("content", "")[:100]))))
+                        if doc_id not in doc_scores:
+                            doc_scores[doc_id] = 0.0
+                            doc_data[doc_id] = doc.copy()
+                            doc_data[doc_id]["query_trace"] = []
+                        try:
+                            doc_scores[doc_id] += float(score)
+                        except Exception:
+                            doc_scores[doc_id] += 0.0
+                        doc_data[doc_id]["query_trace"].append(q)
+                except Exception:
+                    pass
+
+        docs_sorted = []
+        for doc_id in sorted(
+                doc_scores.keys(),
+                key=lambda x: doc_scores[x], reverse=True):
+            doc = doc_data[doc_id]
+            doc["fused_score"] = doc_scores[doc_id]
+            docs_sorted.append(doc)
+
+        all_docs.append(docs_sorted)
+        if (i + 1) % 200 == 0:
+            print(f"  ... {i+1}/{n} retrieved")
+
+    print(f"  ✓ Phase 3 done: retrieval in {time.time()-t3:.1f}s")
+
+    # Free retriever GPU memory before Phase 4 vLLM subprocess
+    if retriever is not None:
+        del retriever
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print("  ✓ Retriever GPU memory freed")
+
+    # ── Phase 4: Answer ALL (generator model, subprocess) ──
+    print(f"\n[Phase 4/4] Generating answers for {n} questions "
+          f"({os.path.basename(generator_model)}) ...")
+    t4 = time.time()
+
+    ans_messages = []
+    for i, qd in enumerate(questions):
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        docs = all_docs[i]
+        ctx = "\n\n".join(
+            [f"Document [{j+1}] (Title: {d.get('title','Untitled')})\n"
+             f"{d.get('content','')}"
+             for j, d in enumerate(docs[:25])]
+        ) or "No documents."
+
+        fmt_vars = {
+            "context": ctx,
+            "question": qd["question"],
+            "options": options_text,
+        }
+        # generator v2 needs extra context
+        if generator_prompt == "v2":
+            p = plans[i]
+            fmt_vars["hypothesis_summary"] = (
+                f"Best guess: {p.get('best_guess','')} — "
+                f"{p.get('reasoning','')}"
+            )
+            fmt_vars["queries_summary"] = "\n".join(
+                f"  {j+1}. {q}" for j, q in enumerate(all_queries[i]))
+
+        user = g_prompt["user"].format(**fmt_vars)
+        ans_messages.append([
+            {"role": "system", "content": g_prompt["system"]},
+            {"role": "user", "content": user},
+        ])
+
+    ans_texts = _run_phase_in_subprocess(
+        generator_model, ans_messages, gpu_mem, max_model_len, max_tokens)
+
+    print(f"  ✓ Phase 4 done: answers in {time.time()-t4:.1f}s")
+
+    # ── Compile Results ──
+    print(f"\n[Result] Compiling ...")
+    results = []
+    correct = 0
+    total = 0
+    for i, qd in enumerate(questions):
+        correct_answer = qd.get("answer_idx", qd.get("answer", ""))
+        raw_resp = ans_texts[i]
+        predicted = parse_answer(raw_resp)
+        is_correct = predicted.upper() == correct_answer.upper()
+        if is_correct:
+            correct += 1
+        total += 1
+        results.append({
+            "question_id": i,
+            "question": qd["question"],
+            "options": qd["options"],
+            "correct_answer": correct_answer,
+            "modes": {
+                combo_tag: {
+                    "num_queries": len(all_queries[i]),
+                    "num_docs": len(all_docs[i]),
+                    "queries": all_queries[i],
+                    "plan": plans[i],
+                    "raw_response": raw_resp,
+                    "predicted_answer": predicted,
+                    "is_correct": is_correct,
+                }
+            },
+        })
+
+    elapsed = time.time() - t_total
+    accuracy = correct / total * 100 if total > 0 else 0
+
+    summary = {
+        "config": {
+            "base_model": base_model,
+            "hypothesis_checkpoint": hypothesis_checkpoint,
+            "rewriter_checkpoint": rewriter_checkpoint,
+            "generator_checkpoint": generator_checkpoint,
+            "hypothesis_prompt": hypothesis_prompt,
+            "rewriting_prompt": rewriting_prompt,
+            "generator_prompt": generator_prompt,
+            "combo_tag": combo_tag,
+            "total_evaluated": total,
+            "total_docs": total_docs,
+            "gpu_mem": gpu_mem,
+            "max_model_len": max_model_len,
+            "max_tokens": max_tokens,
+        },
+        "timing": {
+            "total_seconds": elapsed,
+            "avg_per_question": elapsed / total if total else 0,
+            "questions_per_minute":
+                total / elapsed * 60 if elapsed > 0 else 0,
+        },
+        "mode_results": {
+            combo_tag: {
+                "correct": correct, "total": total, "accuracy": accuracy,
+            }
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    print(f"\n{'='*70}")
+    print(f"[{combo_tag}] {accuracy:.2f}% ({correct}/{total}) "
+          f"in {elapsed:.0f}s "
+          f"({summary['timing']['questions_per_minute']:.1f} q/min)")
+    print(f"{'='*70}")
+
+    # Save — name encodes prompt combination
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file = os.path.join(output_dir, f"medqa_{combo_tag}_{ts}.json")
+    with open(out_file, "w") as f:
+        json.dump({"summary": summary, "results": results},
+                  f, indent=2, ensure_ascii=False)
+    print(f"✓ Saved: {out_file}")
+
+    return {"combo": combo_tag, "accuracy": accuracy,
+            "correct": correct, "total": total, "file": out_file}
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="ARC Challenge Max Async Parallel Evaluation",
+        description='MedQA RAG Evaluation v2 (Prompt-Selectable Ablation)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 Examples:
-  # CoT baseline only (no RAG)
-  python evaluate_arc_challenge.py --modes cot --max-questions 1273
+  # Hypothesis mode with specific prompts
+  python evaluate_medqa_v2.py --mode hypothesis \\
+      --hypothesis-prompt v1 --rewriting-prompt v2 --generator-prompt v1 \\
+      --model Qwen/Qwen3-4B-Instruct-2507 --max-questions 1273
 
-  # RAG modes only
-  python evaluate_arc_challenge.py --modes direct baseline planning --max-questions 1273
+  # Run all 9 hypothesis×rewriting combos (generator=v1)
+  python evaluate_medqa_v2.py --mode hypothesis --run-all \\
+      --model Qwen/Qwen3-4B-Instruct-2507 --max-questions 1273
 
-  # All modes including CoT
-  python evaluate_arc_challenge.py --modes cot direct baseline planning --max-questions 100
+  # With checkpoints
+  python evaluate_medqa_v2.py --mode hypothesis \\
+      --hypothesis-prompt v1 --rewriting-prompt v1 \\
+      --model Qwen/Qwen3-4B-Instruct-2507 \\
+      --hypothesis-checkpoint /path/to/checkpoint-1100
 
-  # Quick test (10 questions)
-  python evaluate_arc_challenge.py --max-questions 10
-
-  # Full RAG evaluation with max parallelism
-  python evaluate_arc_challenge.py --max-questions 1273 --max-concurrent 100
+  # Baseline modes (cot, direct, baseline)
+  python evaluate_medqa_v2.py --mode cot --max-questions 1273
+  python evaluate_medqa_v2.py --mode direct --max-questions 1273
+  python evaluate_medqa_v2.py --mode baseline --max-questions 1273
         """
     )
-    
-    parser.add_argument('--max-questions', '-n', type=int, default=2000)
-    parser.add_argument('--max-concurrent', '-c', type=int, default=100,
-                       help='Max concurrent API requests (default: 100)')
-    parser.add_argument('--llm-provider', type=str, default='openai', choices=['openai', 'vllm'],
-                       help='LLM backend provider: openai API or local vLLM')
-    parser.add_argument('--modes', '-m', nargs='+', 
-                       choices=['cot', 'direct', 'baseline', 'planning', 'planning_v2', 'planning_v3', 'planning_v4', 'planning_v4_grpo', 'planning_v5', 'planning_v6'],
-                       default=['direct', 'baseline', 'planning'],
-                       help='Modes: v2=diagnostic, v3=adaptive, v4=answer-focused, v4_grpo=GRPO-trained rewriter, v5=plan+queries, v6=dual-hypothesis')
+
+    # ── Mode selection ──
+    parser.add_argument(
+        '--mode', type=str, default='hypothesis',
+        choices=['cot', 'direct', 'baseline', 'hypothesis'],
+        help='Evaluation mode (default: hypothesis)')
+    parser.add_argument(
+        '--hypothesis-prompt', type=str, default='v7',
+        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'],
+        help='Hypothesis prompt version (default: v7)')
+    parser.add_argument(
+        '--rewriting-prompt', type=str, default='v10',
+        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'],
+        help='Rewriting prompt version (default: v10)')
+    parser.add_argument(
+        '--generator-prompt', type=str, default='v1',
+        choices=['v1', 'v2'],
+        help='Generator prompt version (default: v1)')
+    parser.add_argument(
+        '--run-all', action='store_true',
+        help='Run all 9 hypothesis×rewriting combos with generator=v1')
+
+    # ── Model & checkpoints ──
     parser.add_argument('--model', type=str, default='gpt-4o-mini')
-    parser.add_argument('--retriever', type=str, default='Contriever')
-    parser.add_argument('--rewriter-adapter-path', type=str, default=None,
-                       help='Path to GRPO-trained LoRA adapter for rewriter (required for planning_v4_grpo mode)')
+    parser.add_argument('--hypothesis-checkpoint', type=str, default=None,
+                       help='Path to hypothesis checkpoint (Phase 1 model)')
+    parser.add_argument('--rewriter-checkpoint', type=str, default=None,
+                       help='Path to rewriter checkpoint (Phase 2 model)')
     parser.add_argument('--rewriter-base-model', type=str, default=None,
-                       help='Base model for GRPO rewriter (defaults to --model)')
+                       help='Base model for rewriter (defaults to --model)')
+
+    # ── Evaluation settings ──
+    parser.add_argument('--max-questions', '-n', type=int, default=10)
+    parser.add_argument('--max-concurrent', '-c', type=int, default=100)
+    parser.add_argument('--llm-provider', type=str, default='openai',
+                       choices=['openai', 'vllm'])
+    parser.add_argument('--retriever', type=str, default='contriever')
     parser.add_argument(
         '--retrieval-dataset',
         type=parse_retrieval_dataset,
-        default=RETRIEVAL_DATASET_TO_CORPUS["wikipedia"],
-        metavar='{textbooks,pubmed,wikipedia}',
-        help='Retrieval dataset for RAG modes (default: wikipedia)',
-    )
-    # Backward compatibility: keep old flag, but prefer --retrieval-dataset.
-    parser.add_argument('--corpus', type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument('--output-dir', '-o', type=str, default='results')
+        default=RETRIEVAL_DATASET_TO_CORPUS["textbooks"],
+        metavar='{textbooks,pubmed}',
+        help='Retrieval dataset (default: textbooks)')
+    parser.add_argument('--corpus', type=str, default='arc_corpus',
+                       help='Corpus to use')
+    parser.add_argument('--output-dir', '-o', type=str, default='outputs')
+    parser.add_argument('--api-base', type=str, default=None)
+    parser.add_argument('--total-docs', type=int, default=15)
+
+    # ── vLLM settings ──
     parser.add_argument('--vllm-tensor-parallel-size', type=int, default=1)
-    parser.add_argument('--vllm-gpu-memory-utilization', type=float, default=0.9)
-    parser.add_argument('--vllm-max-tokens', type=int, default=4096)
-    parser.add_argument('--vllm-max-concurrent', type=int, default=1,
-                       help='Concurrent local generations when using vLLM backend (keep 1 for stability)')
-    parser.add_argument('--vllm-max-model-len', type=int, default=8192,
-                       help='Maximum model context length for vLLM (default: 8192)')
-    parser.add_argument('--total-docs', type=int, default=15,
-                       help='Total documents to retrieve per RAG mode (default: 15)')
-    
+    parser.add_argument('--vllm-gpu-memory-utilization', type=float,
+                       default=0.9)
+    parser.add_argument('--vllm-max-tokens', type=int, default=2048)
+    parser.add_argument('--vllm-max-concurrent', type=int, default=1)
+    parser.add_argument('--vllm-max-model-len', type=int, default=8192)
+
     args = parser.parse_args()
-    
     corpus_name = args.corpus if args.corpus else args.retrieval_dataset
 
-    # Run async evaluation
-    asyncio.run(run_evaluation_async(
-        max_questions=args.max_questions,
-        llm_provider=args.llm_provider,
-        model_name=args.model,
-        retriever_name=args.retriever,
-        corpus_name=corpus_name,
-        max_concurrent=args.max_concurrent,
-        output_dir=args.output_dir,
-        modes=args.modes,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_max_tokens=args.vllm_max_tokens,
-        vllm_max_concurrent=args.vllm_max_concurrent,
-        vllm_max_model_len=args.vllm_max_model_len,
-        total_docs=args.total_docs,
-        rewriter_adapter_path=args.rewriter_adapter_path,
-        rewriter_base_model=args.rewriter_base_model,
-    ))
+    # ── Hypothesis mode (batch-phased) ──
+    if args.mode == 'hypothesis':
+        if args.run_all:
+            # Run all 9 combos: hypothesis × rewriting, generator=v1
+            combos = [
+                (hv, rv)
+                for hv in ['v1', 'v2', 'v3']
+                for rv in ['v1', 'v2', 'v3']
+            ]
+            summary_rows = []
+            print(f"\\n{'#'*70}")
+            print(f"Running ALL {len(combos)} prompt combinations")
+            print(f"{'#'*70}")
+            for idx, (hv, rv) in enumerate(combos, 1):
+                print(f"\\n\\n{'#'*70}")
+                print(f"  Combo {idx}/{len(combos)}: "
+                      f"hypothesis={hv}, rewriting={rv}, generator=v1")
+                print(f"{'#'*70}")
+                if args.llm_provider == "openai":
+                    result = asyncio.run(run_batch_phased_evaluation_openai(
+                        base_model=args.model,
+                        rewriter_checkpoint=args.rewriter_checkpoint,
+                        hypothesis_checkpoint=args.hypothesis_checkpoint,
+                        max_questions=args.max_questions,
+                        total_docs=args.total_docs,
+                        max_tokens=args.vllm_max_tokens,
+                        max_concurrent=args.max_concurrent,
+                        output_dir=args.output_dir,
+                        retriever_name=args.retriever,
+                        corpus_name=corpus_name,
+                        hypothesis_prompt=hv,
+                        rewriting_prompt=rv,
+                        generator_prompt='v1',
+                        api_base=args.api_base,
+                    ))
+                else:
+                    result = run_batch_phased_evaluation(
+                        base_model=args.model,
+                        rewriter_checkpoint=args.rewriter_checkpoint,
+                        hypothesis_checkpoint=args.hypothesis_checkpoint,
+                        max_questions=args.max_questions,
+                        total_docs=args.total_docs,
+                        gpu_mem=args.vllm_gpu_memory_utilization,
+                        max_model_len=args.vllm_max_model_len,
+                        max_tokens=args.vllm_max_tokens,
+                        output_dir=args.output_dir,
+                        retriever_name=args.retriever,
+                        corpus_name=corpus_name,
+                        hypothesis_prompt=hv,
+                        rewriting_prompt=rv,
+                        generator_prompt='v1',
+                    )
+                summary_rows.append(result)
+
+            # Print summary table
+            print(f"\\n\\n{'='*70}")
+            print("ABLATION SUMMARY")
+            print(f"{'='*70}")
+            print(f"{'Combo':<15} {'Accuracy':>10} {'Correct':>10} "
+                  f"{'Total':>8}")
+            print(f"{'-'*15} {'-'*10} {'-'*10} {'-'*8}")
+            for row in summary_rows:
+                print(f"{row['combo']:<15} "
+                      f"{row['accuracy']:>9.2f}% "
+                      f"{row['correct']:>10} "
+                      f"{row['total']:>8}")
+            print(f"{'='*70}")
+
+            # Save summary CSV
+            import csv
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_file = os.path.join(
+                args.output_dir, f"ablation_summary_{ts}.csv")
+            with open(csv_file, "w", newline="") as f:
+                w = csv.DictWriter(
+                    f, fieldnames=["combo", "accuracy", "correct",
+                                   "total", "file"])
+                w.writeheader()
+                w.writerows(summary_rows)
+            print(f"✓ Summary CSV saved: {csv_file}")
+
+        else:
+            # Single hypothesis combo
+            if args.llm_provider == "openai":
+                asyncio.run(run_batch_phased_evaluation_openai(
+                    base_model=args.model,
+                    rewriter_checkpoint=args.rewriter_checkpoint,
+                    hypothesis_checkpoint=args.hypothesis_checkpoint,
+                    max_questions=args.max_questions,
+                    total_docs=args.total_docs,
+                    max_tokens=args.vllm_max_tokens,
+                    max_concurrent=args.max_concurrent,
+                    output_dir=args.output_dir,
+                    retriever_name=args.retriever,
+                    corpus_name=corpus_name,
+                    hypothesis_prompt=args.hypothesis_prompt,
+                    rewriting_prompt=args.rewriting_prompt,
+                    generator_prompt=args.generator_prompt,
+                    api_base=args.api_base,
+                ))
+            else:
+                run_batch_phased_evaluation(
+                    base_model=args.model,
+                    rewriter_checkpoint=args.rewriter_checkpoint,
+                    hypothesis_checkpoint=args.hypothesis_checkpoint,
+                    max_questions=args.max_questions,
+                    total_docs=args.total_docs,
+                    gpu_mem=args.vllm_gpu_memory_utilization,
+                    max_model_len=args.vllm_max_model_len,
+                    max_tokens=args.vllm_max_tokens,
+                    output_dir=args.output_dir,
+                    retriever_name=args.retriever,
+                    corpus_name=corpus_name,
+                    hypothesis_prompt=args.hypothesis_prompt,
+                    rewriting_prompt=args.rewriting_prompt,
+                    generator_prompt=args.generator_prompt,
+                )
+
+    else:
+        # ── Baseline modes (cot, direct, baseline) via async evaluator ──
+        asyncio.run(run_evaluation_async(
+            max_questions=args.max_questions,
+            llm_provider=args.llm_provider,
+            model_name=args.model,
+            retriever_name=args.retriever,
+            corpus_name=corpus_name,
+            max_concurrent=args.max_concurrent,
+            output_dir=args.output_dir,
+            modes=[args.mode],
+            vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+            vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            vllm_max_tokens=args.vllm_max_tokens,
+            vllm_max_concurrent=args.vllm_max_concurrent,
+            vllm_max_model_len=args.vllm_max_model_len,
+            total_docs=args.total_docs,
+            rewriter_adapter_path=args.rewriter_checkpoint,
+            rewriter_base_model=args.rewriter_base_model,
+            api_base=args.api_base,
+        ))
 
 
 if __name__ == "__main__":
+    import multiprocessing as _main_mp
+    _main_mp.set_start_method("spawn", force=True)
     main()
