@@ -594,9 +594,9 @@ class AsyncRAGEvaluator:
             words = re.findall(r'\b[A-Za-z]{4,}\b', question)
             queries = [
                 question,
-                f"{' '.join(words[:3])} symptoms diagnosis" if words else question,
+                f"{' '.join(words[:3])} key characteristics concept" if words else question,
                 f"{' '.join(words[:3])} treatment" if words else question,
-                f"{' '.join(words[1:4])} medical" if len(words) > 1 else question,
+                f"{' '.join(words[1:4])} science" if len(words) > 1 else question,
                 f"{' '.join(words[:2])} pathophysiology" if len(words) > 1 else question,
             ][:self.num_subqueries]
         
@@ -616,7 +616,7 @@ class AsyncRAGEvaluator:
         prompt = PLANNING_V2_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert medical diagnostician. Provide precise, clinically-focused analysis."},
+            {"role": "system", "content": "You are an expert problem solver. Provide precise, logically-focused analysis."},
             {"role": "user", "content": prompt}
         ]
         
@@ -634,13 +634,13 @@ class AsyncRAGEvaluator:
             plan = {}
         
         # Ensure required fields exist
-        if not plan.get("key_clinical_features"):
+        if not plan.get("key_features"):
             words = re.findall(r'\b[A-Za-z]{4,}\b', question)
-            plan["key_clinical_features"] = words[:5] if words else ["symptom"]
-        if not plan.get("primary_diagnosis_hypothesis"):
-            plan["primary_diagnosis_hypothesis"] = "unknown condition"
-        if not plan.get("differential_diagnoses"):
-            plan["differential_diagnoses"] = []
+            plan["key_features"] = words[:5] if words else ["symptom"]
+        if not plan.get("primary_hypothesis"):
+            plan["primary_hypothesis"] = "unknown condition"
+        if not plan.get("alternative_hypotheses"):
+            plan["alternative_hypotheses"] = []
         if not plan.get("distinguishing_features"):
             plan["distinguishing_features"] = []
         
@@ -654,21 +654,21 @@ class AsyncRAGEvaluator:
     ) -> List[str]:
         """Generate targeted queries based on the diagnostic plan"""
         
-        key_features = ", ".join(plan.get("key_clinical_features", [])[:5])
-        primary_diagnosis = plan.get("primary_diagnosis_hypothesis", "unknown")
-        differentials = ", ".join(plan.get("differential_diagnoses", [])[:3])
+        key_features = ", ".join(plan.get("key_features", [])[:5])
+        primary_hypothesis = plan.get("primary_hypothesis", "unknown")
+        differentials = ", ".join(plan.get("alternative_hypotheses", [])[:3])
         distinguishing = ", ".join(plan.get("distinguishing_features", [])[:3])
         
         prompt = PLANNING_V2_QUERY_PROMPT.format(
             question=question,
             key_features=key_features,
-            primary_diagnosis=primary_diagnosis,
+            primary_hypothesis=primary_hypothesis,
             differentials=differentials,
             distinguishing=distinguishing
         )
         
         messages = [
-            {"role": "system", "content": "You are a medical information retrieval expert. Generate precise, targeted search queries."},
+            {"role": "system", "content": "You are an information retrieval expert. Generate precise, targeted search queries."},
             {"role": "user", "content": prompt}
         ]
         
@@ -687,11 +687,11 @@ class AsyncRAGEvaluator:
         # Fallback if parsing fails
         if len(queries) < 3:
             queries = [
-                f"{primary_diagnosis} {key_features}",
-                f"{primary_diagnosis} vs {differentials} differential diagnosis",
-                f"{distinguishing} diagnostic criteria",
-                f"{primary_diagnosis} pathophysiology mechanism",
-                f"{primary_diagnosis} treatment management",
+                f"{primary_hypothesis} {key_features}",
+                f"{primary_hypothesis} vs {differentials} comparison",
+                f"{distinguishing} key criteria",
+                f"{primary_hypothesis} underlying mechanism",
+                f"{primary_hypothesis} application management",
             ][:5]
         
         return queries[:5]
@@ -710,7 +710,7 @@ class AsyncRAGEvaluator:
         prompt = PLANNING_V3_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert medical diagnostician. Be concise and precise."},
+            {"role": "system", "content": "You are an expert problem solver. Be concise and precise."},
             {"role": "user", "content": prompt}
         ]
         
@@ -728,18 +728,18 @@ class AsyncRAGEvaluator:
             plan = {}
         
         # Ensure required fields exist with defaults
-        plan.setdefault("question_type", "diagnostic")
+        plan.setdefault("question_type", "factual")
         plan.setdefault("complexity", "moderate")
-        plan.setdefault("key_clinical_clues", [])
+        plan.setdefault("key_clues", [])
         plan.setdefault("most_likely_answer", "")
         plan.setdefault("confidence", "medium")
         plan.setdefault("what_evidence_needed", [])
         plan.setdefault("differential_if_uncertain", [])
         
         # Fallback for key clues
-        if not plan["key_clinical_clues"]:
+        if not plan["key_clues"]:
             words = re.findall(r'\b[A-Za-z]{4,}\b', question)
-            plan["key_clinical_clues"] = words[:4] if words else ["symptom"]
+            plan["key_clues"] = words[:4] if words else ["symptom"]
         
         return plan
     
@@ -751,9 +751,9 @@ class AsyncRAGEvaluator:
     ) -> List[str]:
         """Generate adaptive number of queries based on the plan"""
         
-        question_type = plan.get("question_type", "diagnostic")
+        question_type = plan.get("question_type", "factual")
         complexity = plan.get("complexity", "moderate")
-        key_clues = ", ".join(plan.get("key_clinical_clues", [])[:4])
+        key_clues = ", ".join(plan.get("key_clues", [])[:4])
         likely_answer = plan.get("most_likely_answer", "unknown")
         evidence_needed = ", ".join(plan.get("what_evidence_needed", [])[:3])
         differentials = plan.get("differential_if_uncertain", [])
@@ -774,7 +774,7 @@ class AsyncRAGEvaluator:
         )
         
         messages = [
-            {"role": "system", "content": "You are a medical search expert. Generate only essential, highly targeted queries. Quality over quantity."},
+            {"role": "system", "content": "You are a search expert. Generate only essential, highly targeted queries. Quality over quantity."},
             {"role": "user", "content": prompt}
         ]
         
@@ -815,7 +815,7 @@ class AsyncRAGEvaluator:
         prompt = PLANNING_V4_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert medical diagnostician. Make your best diagnostic guess and identify what evidence would confirm it."},
+            {"role": "system", "content": "You are an expert problem solver. Make your best guess and identify what evidence would confirm it."},
             {"role": "user", "content": prompt}
         ]
         
@@ -868,7 +868,7 @@ class AsyncRAGEvaluator:
         )
         
         messages = [
-            {"role": "system", "content": "Generate highly specific medical search queries."},
+            {"role": "system", "content": "Generate highly specific search queries."},
             {"role": "user", "content": prompt}
         ]
         
@@ -889,7 +889,7 @@ class AsyncRAGEvaluator:
             queries = [
                 f"{best_guess} {discriminating_features}",
                 f"{confirming_evidence}",
-                f"{reasoning} diagnosis",
+                f"{reasoning} concept",
             ]
         
         return queries[:5]  # Cap at 5
@@ -948,7 +948,7 @@ class AsyncRAGEvaluator:
             queries = [
                 f"{best_guess} {discriminating_features}",
                 f"{confirming_evidence}",
-                f"{plan.get('reasoning', '')} diagnosis",
+                f"{plan.get('reasoning', '')} concept",
             ]
         
         return queries[:5]
@@ -962,12 +962,12 @@ class AsyncRAGEvaluator:
         options: Dict[str, str],
         session: aiohttp.ClientSession,
     ) -> Dict[str, Any]:
-        """Generate dual hypothesis plan for differential diagnosis"""
+        """Generate dual hypothesis plan for comparison"""
         options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
         prompt = PLANNING_V6_PROMPT.format(question=question, options=options_text)
         
         messages = [
-            {"role": "system", "content": "You are an expert medical diagnostician. Use differential diagnosis to generate two competing hypotheses."},
+            {"role": "system", "content": "You are an expert problem solver. Use alternative analysis to generate two competing hypotheses."},
             {"role": "user", "content": prompt}
         ]
         
@@ -987,14 +987,14 @@ class AsyncRAGEvaluator:
         # Ensure required fields
         if "hypothesis_1" not in plan:
             plan["hypothesis_1"] = {
-                "diagnosis": "",
+                "hypothesis": "",
                 "key_reasoning": "",
                 "supporting_features": [],
                 "evidence_to_verify": []
             }
         if "hypothesis_2" not in plan:
             plan["hypothesis_2"] = {
-                "diagnosis": "",
+                "hypothesis": "",
                 "key_reasoning": "",
                 "supporting_features": [],
                 "evidence_to_verify": []
@@ -1015,11 +1015,11 @@ class AsyncRAGEvaluator:
         h1 = plan.get("hypothesis_1", {})
         h2 = plan.get("hypothesis_2", {})
         
-        h1_diagnosis = h1.get("diagnosis", "unknown")
+        h1_hypothesis = h1.get("hypothesis", "unknown")
         h1_reasoning = h1.get("key_reasoning", "")
         h1_evidence = ", ".join(h1.get("evidence_to_verify", [])[:2])
         
-        h2_diagnosis = h2.get("diagnosis", "unknown")
+        h2_hypothesis = h2.get("hypothesis", "unknown")
         h2_reasoning = h2.get("key_reasoning", "")
         h2_evidence = ", ".join(h2.get("evidence_to_verify", [])[:2])
         
@@ -1027,10 +1027,10 @@ class AsyncRAGEvaluator:
         
         prompt = PLANNING_V6_QUERY_PROMPT.format(
             question=question,
-            h1_diagnosis=h1_diagnosis,
+            h1_hypothesis=h1_hypothesis,
             h1_reasoning=h1_reasoning,
             h1_evidence=h1_evidence,
-            h2_diagnosis=h2_diagnosis,
+            h2_hypothesis=h2_hypothesis,
             h2_reasoning=h2_reasoning,
             h2_evidence=h2_evidence,
             discriminating=discriminating
@@ -1056,11 +1056,11 @@ class AsyncRAGEvaluator:
         # Fallback if parsing fails
         if len(queries) < 3:
             queries = [
-                f"{h1_diagnosis} {h1_evidence}",
-                f"{h2_diagnosis} {h2_evidence}",
-                f"{h1_diagnosis} vs {h2_diagnosis} differential",
+                f"{h1_hypothesis} {h1_evidence}",
+                f"{h2_hypothesis} {h2_evidence}",
+                f"{h1_hypothesis} vs {h2_hypothesis} comparison",
                 f"{discriminating} distinguishing features",
-                f"clinical presentation comparison",
+                f"problem context comparison",
             ]
         
         return queries[:6]  # Cap at 6
@@ -2153,7 +2153,7 @@ async def run_batch_phased_evaluation_openai(
                 bg = p.get("best_guess", "")
                 cf = _format_list(p.get("confirming_evidence", []))
                 df = _format_list(p.get("discriminating_features", []))
-                queries = [f"{bg} {df}", cf, f"{p.get('reasoning', '')} diagnosis"]
+                queries = [f"{bg} {df}", cf, f"{p.get('reasoning', '')} concept"]
             all_queries.append(queries[:5])
 
         print(f"  ✓ Phase 2 done: {len(all_queries)} query sets "
@@ -2515,7 +2515,7 @@ def run_batch_phased_evaluation(
             cf = _format_list(p.get("confirming_evidence", []))
             df = _format_list(p.get("discriminating_features", []))
             queries = [f"{bg} {df}", cf,
-                       f"{p.get('reasoning','')} diagnosis"]
+                       f"{p.get('reasoning','')} concept"]
         all_queries.append(queries[:5])
 
     print(f"  ✓ Phase 2 done: {len(all_queries)} query sets "

@@ -19,8 +19,8 @@ Each prompt is a dict with:
 HYPOTHESIS_PROMPTS = {
     "v1": {
         "system": (
-            "You are an expert medical diagnostician "
-            "taking a medical licensing exam."
+            "You are an expert problem solver "
+            "taking a science and logic challenge exam."
         ),
         "user": (
             "Question: {question}\n\n"
@@ -28,7 +28,7 @@ HYPOTHESIS_PROMPTS = {
             "Step 1: Identify the KEY DISCRIMINATING FEATURES "
             "that distinguish between the options.\n"
             "Step 2: Make your BEST GUESS for the answer "
-            "based on medical knowledge.\n"
+            "based on scientific knowledge.\n"
             "Step 3: Identify what SPECIFIC EVIDENCE "
             "would CONFIRM your answer.\n\n"
             "Output in JSON:\n"
@@ -47,15 +47,15 @@ HYPOTHESIS_PROMPTS = {
     },
     "v2": {
         "system": (
-            "You are an expert medical diagnostician "
-            "taking a medical licensing exam."
+            "You are an expert problem solver "
+            "taking a science and logic challenge exam."
         ),
         "user": (
             "Question: {question}\n\n"
             "Options:\n{options}\n\n"
             "Analyze this question carefully. Think step-by-step about "
-            "each option, considering the clinical presentation and "
-            "relevant medical knowledge. Reason through the differential "
+            "each option, considering the problem context and "
+            "relevant scientific knowledge. Reason through the differential "
             "diagnosis before making your final assessment.\n\n"
             "After your analysis, provide your final assessment in JSON:\n"
             '{{\n'
@@ -73,8 +73,8 @@ HYPOTHESIS_PROMPTS = {
     },
     "v3": {
         "system": (
-            "You are an expert diagnostician "
-            "taking a licensing exam."
+            "You are an expert problem solver "
+            "taking a science and logic challenge exam."
         ),
         "user": (
             "Question: {question}\n\n"
@@ -214,13 +214,13 @@ HYPOTHESIS_PROMPTS = {
 REWRITING_PROMPTS = {
     "v1": {
         "system": (
-            "You are a medical search query expert. "
+            "You are a search query expert. "
             "Generate precise, targeted search queries. "
             "Output ONLY the 3 queries in the exact format requested."
         ),
         "user": (
             "Generate 3 highly targeted search queries to find evidence "
-            "for this medical question.\n\n"
+            "for this science question.\n\n"
             "Question: {question}\n"
             "Best Guess Answer: {best_guess}\n"
             "Reasoning: {reasoning}\n"
@@ -230,8 +230,8 @@ REWRITING_PROMPTS = {
             "Query 1: Find evidence supporting {best_guess} "
             "- focus on the main reasoning\n"
             "Query 2: Find distinguishing criteria "
-            "for differential diagnosis\n"
-            "Query 3: Find specific clinical/pathological features\n\n"
+            "for alternative options\n"
+            "Query 3: Find specific scientific/logical features\n\n"
             "Format:\n"
             "Query 1: [query]\n"
             "Query 2: [query]\n"
@@ -241,13 +241,13 @@ REWRITING_PROMPTS = {
     },
     "v2": {
         "system": (
-            "You are a medical search query expert. "
+            "You are a search query expert. "
             "Generate precise, targeted search queries. "
             "Output ONLY the 3 queries in the exact format requested."
         ),
         "user": (
             "Generate 3 highly targeted search queries to find evidence "
-            "for this medical question.\n\n"
+            "for this science question.\n\n"
             "Question: {question}\n"
             "Best Guess Answer: {best_guess}\n"
             "Reasoning: {reasoning}\n"
@@ -259,7 +259,7 @@ REWRITING_PROMPTS = {
             "- focus on the main reasoning\n"
             "Query 2: Find distinguishing criteria between "
             "{best_guess} and {alternative_if_wrong}\n"
-            "Query 3: Find specific clinical/pathological features\n\n"
+            "Query 3: Find specific scientific/logical features\n\n"
             "Format:\n"
             "Query 1: [query]\n"
             "Query 2: [query]\n"
@@ -498,8 +498,8 @@ REWRITING_PROMPTS = {
 GENERATOR_PROMPTS = {
     "v1": {
         "system": (
-            'You are a helpful medical expert, and your task is to answer '
-            'a multi-choice medical question using the relevant documents. '
+            'You are a helpful science and reasoning expert, and your task is to answer '
+            'a multi-choice science question using the relevant documents. '
             'Please first think step-by-step and then choose the answer '
             'from the provided options. Organize your output in a json '
             'formatted as Dict{"step_by_step_thinking": Str(explanation), '
@@ -516,8 +516,8 @@ GENERATOR_PROMPTS = {
     },
     "v2": {
         "system": (
-            'You are a helpful medical expert, and your task is to answer '
-            'a multi-choice medical question using the relevant documents '
+            'You are a helpful science and reasoning expert, and your task is to answer '
+            'a multi-choice science question using the relevant documents '
             'and diagnostic hypothesis. '
             'Please first think step-by-step and then choose the answer '
             'from the provided options. Organize your output in a json '
@@ -544,8 +544,8 @@ GENERATOR_PROMPTS = {
 # ============================================================================
 
 COT_SYSTEM_PROMPT = (
-    'You are a helpful medical expert, and your task is to answer '
-    'a multi-choice medical question. Please first think step-by-step '
+    'You are a helpful science and reasoning expert, and your task is to answer '
+    'a multi-choice science question. Please first think step-by-step '
     'and then choose the answer from the provided options. '
     'Organize your output in a json formatted as '
     'Dict{"step_by_step_thinking": Str(explanation), '
@@ -573,7 +573,7 @@ Sub-query 4:
 Sub-query 5:"""
 
 # Simple planning prompt for 'planning' baseline mode
-PLANNING_PROMPT = """Analyze the following medical question and extract key information.
+PLANNING_PROMPT = """Analyze the following science question and extract key information.
 
 Question: {question}
 
@@ -605,3 +605,42 @@ def load_mirage_prompts():
         return True
     except ImportError:
         return False
+
+PLANNING_V4_PROMPT = """You are an expert taking a science and logic challenge exam.
+
+Question: {question}
+
+Options:
+{options}
+
+Step 1: Identify the KEY DISCRIMINATING FEATURES that distinguish between the options.
+Step 2: Make your BEST GUESS for the answer based on scientific knowledge.
+Step 3: Identify what SPECIFIC EVIDENCE would CONFIRM your answer.
+
+Output in JSON:
+{{
+    "discriminating_features": ["2-3 features that distinguish between options"],
+    "best_guess": "A/B/C/D",
+    "reasoning": "brief explanation why this is the best answer",
+    "confirming_evidence": ["1-3 specific facts that would confirm this answer"],
+    "alternative_if_wrong": "A/B/C/D - only if uncertain"
+}}"""
+
+PLANNING_V4_QUERY_PROMPT = """Generate exactly 3 highly targeted, non-overlapping search queries to find scientific or logical evidence for this question.
+
+Question: {question}
+Best Guess: {best_guess}
+Reasoning: {reasoning}
+Evidence Needed: {confirming_evidence}
+Key Features: {discriminating_features}
+
+RULES:
+1. Output EXACTLY 3 queries.
+2. Query 1: Find evidence supporting the best guess.
+3. Query 2: Find comparative/distinguishing criteria between the best guess and alternatives.
+4. Query 3: Find specific scientific features or definitions.
+
+Output format:
+Query 1: <query>
+Query 2: <query>
+Query 3: <query>"""
