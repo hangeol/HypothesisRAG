@@ -24,7 +24,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 
 # Import generator prompts from central prompts.py
-from prompts import GENERATOR_PROMPTS
+from core.prompts import GENERATOR_PROMPTS
 
 
 # ============================================================================
@@ -80,7 +80,7 @@ def parse_queries_from_completion(completion_text: str, num_queries: int = 3) ->
 def parse_answer(answer_text: str) -> str:
     """Parse answer choice (A, B, C, D) from generator output.
 
-    Reuses the same logic as evaluate_medqa.py parse_answer().
+    Reuses the same logic as scripts/past/evaluate_past.py parse_answer().
     """
     if not answer_text:
         return ""
@@ -250,7 +250,7 @@ def build_hypothesis_plan_queries(
 
 
 # ============================================================================
-# Generator prompt (matches MIRAGE format from evaluate_medqa.py)
+# Generator prompt (matches MIRAGE format used in scripts/evaluate/evaluate.py)
 # ============================================================================
 MIRAGE_SYSTEM_PROMPT = (
     'You are a helpful medical expert, and your task is to answer a multi-choice medical question '
@@ -353,7 +353,7 @@ class RewriterRewardFunction:
         self.generator_prompt_version = generator_prompt_version
 
         # Initialize retriever
-        from retriever import create_retriever
+        from retrieval.retriever import create_retriever
         self.retriever = create_retriever(
             retriever_type="mirage",
             retriever_name=retriever_name,
@@ -606,7 +606,7 @@ class HypothesisRewardFunction:
         self.__name__ = self.__class__.__name__
 
         # Initialize retriever
-        from retriever import create_retriever
+        from retrieval.retriever import create_retriever
         self.retriever = create_retriever(
             retriever_type="mirage",
             retriever_name=retriever_name,

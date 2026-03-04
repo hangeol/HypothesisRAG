@@ -1,94 +1,234 @@
 # HypothesisRAG
 
-의료 도메인 질의응답을 위한 검색 증강 생성(RAG) 파이프라인 실험 프로젝트입니다.
-현재 프로젝트의 **핵심 스크립트는 `evaluate_medqa.py`**이며, 이 중에서도 **`planning_v4`** 모드가 🩺가설(Hypothesis)을 세우고 이를 검증하기 위해 RAG를 수행하는 본 프로젝트의 **핵심 방법론**입니다.
+MedQA 기반 HypothesisRAG 실험 코드입니다.  
+현재 구조는 `평가(Evaluate) / 학습(Train) / 분석(Analysis) / 과거(Past)`로 분리되어 있습니다.
 
-## 목적
+## 1. 폴더 구조
 
-여러 RAG 전략을 비교하여 모델이 스스로 가설을 세우고 검증하는 방식(Hypothesis 기반 Planning)이 검색 품질 및 최종 답변에 어떤 도움을 주는지 확인합니다:
+```text
+HypothesisRAG/
+├── scripts/
+│   ├── evaluate/
+│   │   ├── evaluate.py                 # (기존 evaluate_medqa_v2.py)
+│   │   ├── evaluate_checkpoints.py     # 체크포인트 스윕 평가
+│   ├── train/
+│   │   └── run_training.sh             # 학습 실행 래퍼
+│   ├── analysis/
+│   │   ├── eval_grpo.py
+│   │   ├── analyze_failure_modes.py
+│   │   ├── analyze_best_guess_vs_gold.py
+│   │   ├── compare_v4_v5_results.py
+│   │   └── prune_checkpoints_for_inference.py
+│   └── past/
+│       ├── evaluate_past.py            # (기존 evaluate_medqa.py)
+│       ├── run_ablation_gpu*.sh
+│       ├── run_rag.py
+│       ├── test_rag.py
+│       └── etc/*                       # legacy 코드
+├── training/
+│   ├── train_hypothesis_grpo.py
+│   ├── train_rewriter_grpo.py
+│   └── reward.py
+├── core/
+│   ├── prompts.py                    # canonical prompt registry
+│   └── rag_core.py                   # canonical RAG core module
+├── data/
+├── outputs/
+├── retrieval/
+│   └── retriever.py                  # canonical retriever module
+└── requirements*.txt
+```
 
-- **(A) direct**: Query rewriting 없이 사용자 입력 그대로 검색
-- **(B) baseline**: LLM이 자체적으로 일반적인 query rewriting 수행
-- **(C) planning_v4 (⭐️ 핵심 방법론)**: 주어진 의료 문제에 대해 초기 진단 가설(Best Guess)을 세우고, 이 가설을 확정짓거나 감별 진단하기 위해 필요한 구체적 증거를 찾도록 타겟팅된 검색 쿼리를 생성하는 HypothesisRAG 방법론
+## 2. 환경 설정
 
-
-## 설치
-
-### 1. 환경 설정
+### 2.1 Conda
 
 ```bash
-# Conda 환경 생성 및 활성화 (권장)
-conda create -n rag_compare python=3.10
-conda activate rag_compare
+conda create -n hypothesisrag python=3.10 -y
+conda activate hypothesisrag
+```
 
-# 의존성 설치
+### 2.2 패키지 설치
+
+전체(평가+학습+분석):
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. 환경 변수 설정
+선택 설치:
 
 ```bash
-export OPENAI_API_KEY="your-openai-api-key"
+pip install -r requirements-eval.txt
+pip install -r requirements-train.txt
+pip install -r requirements-analysis.txt
 ```
 
-
-## MedQA 데이터셋 평가 (Async) - ⭐️ 핵심 스크립트 (`evaluate_medqa.py`)
-
-`evaluate_medqa.py`를 통해 전체 파이프라인 및 HypothesisRAG(`planning_v4`)의 성능을 평가합니다. 이 스크립트가 현 RAG 실험 및 검증의 코어(Core) 역할을 수행하며 비동기 처리를 통해 빠르게 실행됩니다.
-
-### 평가 실행
+### 2.3 환경변수
 
 ```bash
-# 빠른 테스트 (10개 문제)
-python evaluate_medqa.py --max-questions 10
-
-# 전체 평가 (모든 문제)
-# 주의: 모든 문제를 평가하려면 시간이 오래 걸릴 수 있습니다.
-python evaluate_medqa.py --max-questions 1273
-
-# 특정 모드만 평가 (예: 핵심 방법론인 planning_v4 집중 평가)
-python evaluate_medqa.py --modes direct baseline planning_v4 --max-questions 50
-
-# Evidence만 평가 (답변 생성 없음 - 검색 성능 측정용)
-python evaluate_medqa.py --no-answers --max-questions 100
+export OPENAI_API_KEY="<your_key>"
 ```
 
-### 평가 옵션
+## 3. 결과 저장 규칙
 
-| 옵션 | 설명 | 기본값 |
-|------|------|--------|
-| `--max-questions`, `-n` | 평가할 최대 문제 수 | 100 |
-| `--modes`, `-m` | 평가할 모드들 | 전체 |
-| `--top-k`, `-k` | 쿼리당 검색 문서 수 | 5 |
-| `--model` | OpenAI 모델명 | gpt-4o-mini |
-| `--no-answers` | 답변 생성 건너뛰기 | False |
-| `--output-dir`, `-o` | 결과 저장 디렉토리 | . |
-
-## 분석 스크립트 (`scripts/`)
-
-- `scripts/analyze_failure_modes.py`: 실패 유형 분석 (R-GAP, R-NOISE 등)
-- `scripts/analyze_best_guess_vs_gold.py`: Planning 단계의 Best Guess 정확도 분석
-- `scripts/compare_v4_v5_results.py`: V4 vs V5 결과 비교
-
-## 주요 파일 구조
+`scripts/evaluate/evaluate.py`는 `--output-dir`를 지정하지 않으면 자동으로 아래에 저장합니다.
 
 ```text
-/
-├── rag_core.py                # Core Logic (Graph definition)
-├── evaluate_medqa.py          # Main Evaluation Script (Async)
-├── run_rag.py                 # CLI Runner
-├── retriever.py               # Retriever Module
-├── config.py                  # Configuration
-├── scripts/                   # Analysis & Utility Scripts
-│   ├── analyze_failure_modes.py
-│   ├── analyze_best_guess_vs_gold.py
-│   └── compare_v4_v5_results.py
-└── etc/                       # Legacy & Test Files
-    ├── evaluate_medqa_sync_legacy.py # Old synchronous evaluator
-    └── test_json_parsing.py
+outputs/results/<provider>/<model>/...
 ```
 
-## 참고 사항
+예시:
+- OpenAI: `outputs/results/openai/gpt-4o-mini/...`
+- Local(vLLM): `outputs/results/local/Qwen_Qwen3-4B-Instruct-2507/...`
 
-1. **MIRAGE 검색 시스템**: 실제 MIRAGE MedRAG 코퍼스가 설정되어 있어야 합니다. 설정되지 않은 경우 mock retrieval이 사용됩니다.
-2. **API 비용**: OpenAI API를 사용합니다. Planning 모드는 추가 LLM 호출이 필요합니다.
+`--output-dir`를 지정하면 해당 경로를 우선 사용합니다.
+
+## 4. Evaluate 사용법
+
+### 4.0 Prompt 로딩 규칙 (`load_mirage_prompts`)
+
+- 기본 프롬프트 레지스트리는 `core/prompts.py`입니다.
+- 실행 시 `MIRAGE/MedRAG/src/template.py`가 있으면 `load_mirage_prompts()`가 MIRAGE 원본 시스템 프롬프트(`general_medrag_system`, `general_cot_system`)를 읽어와 덮어씁니다.
+- Direct rewriting용 query prompt는 `core/prompts.py`의 `DIRECT_REWRITING_PROMPT`입니다.
+- Direct rewriting의 system prompt는 `DIRECT_REWRITING_SYSTEM_PROMPT=""`(빈 문자열)이며, `DIRECT_REWRITING_TARGET_QUERIES=3`, `DIRECT_REWRITING_DOCS_PER_QUERY=5`(총 15)로 고정됩니다.
+- 목적: 로컬 복사본과 MIRAGE 원본 간 프롬프트 drift를 방지하고, CoT/Generator baseline을 MIRAGE와 동일하게 유지하기 위함입니다.
+
+### 4.1 단일 평가 (`evaluate.py`)
+
+OpenAI + Hypothesis 모드:
+
+```bash
+python scripts/evaluate/evaluate.py \
+  --mode hypothesis \
+  --llm-provider openai \
+  --model gpt-4o-mini \
+  --hypothesis-prompt v7 \
+  --rewriting-prompt v10 \
+  --generator-prompt v1 \
+  --max-questions 1273
+```
+
+Local(vLLM) + Hypothesis 모드:
+
+```bash
+python scripts/evaluate/evaluate.py \
+  --mode hypothesis \
+  --llm-provider vllm \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --hypothesis-prompt v7 \
+  --rewriting-prompt v10 \
+  --generator-prompt v1 \
+  --vllm-tensor-parallel-size 1 \
+  --vllm-gpu-memory-utilization 0.9 \
+  --vllm-max-model-len 8192 \
+  --vllm-max-tokens 2048 \
+  --max-questions 1273
+```
+
+체크포인트 override (예: hypothesis/rewriter만 교체):
+
+```bash
+python scripts/evaluate/evaluate.py \
+  --mode hypothesis \
+  --llm-provider vllm \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --hypothesis-checkpoint /path/to/hyp/checkpoint-1400 \
+  --rewriter-checkpoint /path/to/rew/checkpoint-1300 \
+  --hypothesis-prompt v7 --rewriting-prompt v10 --generator-prompt v1
+```
+
+Baseline 모드:
+
+```bash
+python scripts/evaluate/evaluate.py --mode cot --llm-provider openai --model gpt-4o-mini
+python scripts/evaluate/evaluate.py --mode directrag --llm-provider vllm --model Qwen/Qwen3-4B-Instruct-2507
+python scripts/evaluate/evaluate.py --mode directrewriting --llm-provider vllm --model Qwen/Qwen3-4B-Instruct-2507
+```
+
+### 4.2 체크포인트 스윕 (`evaluate_checkpoints.py`)
+
+```bash
+python scripts/evaluate/evaluate_checkpoints.py \
+  outputs/hypothesis_grpo/20260228_172844 \
+  --mode hypothesis \
+  --gpus 0,2 \
+  --max-questions 1273 \
+  --total-docs 15 \
+  --gpu-mem 0.35 \
+  --max-model-len 8192 \
+  --max-tokens 2048 \
+  --vllm-tensor-parallel-size 1 \
+  --hypothesis-prompt v7 --rewriting-prompt v10 --generator-prompt v1
+```
+
+### 4.3 Prompt/Model Ablation (`evaluate.py` 단일 진입점)
+
+```bash
+python scripts/evaluate/evaluate.py \
+  --mode hypothesis \
+  --llm-provider openai \
+  --ablation-models gpt-4o-mini gpt-4o \
+  --ablation-combos v5-v5-v2 v7-v10-v2 \
+  --max-questions 1273 \
+  --max-concurrent 120
+```
+
+## 5. Train 사용법
+
+메인 래퍼: `scripts/train/run_training.sh`  
+(스크립트가 프로젝트 루트로 자동 이동하므로 어느 경로에서 실행해도 됩니다.)
+
+### 5.1 Rewriter 학습
+
+```bash
+bash scripts/train/run_training.sh \
+  --mode rewriter \
+  --gpus 0,1,2 \
+  --num_vllm_gpus 1 \
+  --num_train_gpus 2 \
+  --base_model Qwen/Qwen3-4B-Instruct-2507 \
+  --per_device_bs 1 \
+  --total_batch_size 32 \
+  --group_size 8 \
+  --hypothesis_prompt v7 --rewriting_prompt v10 --generator_prompt v1
+```
+
+### 5.2 Hypothesis 학습
+
+```bash
+bash scripts/train/run_training.sh \
+  --mode hypothesis \
+  --gpus 0,1,2 \
+  --num_vllm_gpus 1 \
+  --num_train_gpus 2 \
+  --base_model Qwen/Qwen3-4B-Instruct-2507 \
+  --per_device_bs 1 \
+  --total_batch_size 32 \
+  --group_size 8 \
+  --hypothesis_prompt v7 --rewriting_prompt v10 --generator_prompt v1
+```
+
+학습 진입점 직접 실행:
+- `training/train_hypothesis_grpo.py`
+- `training/train_rewriter_grpo.py`
+
+## 6. Analysis 사용법
+
+```bash
+python scripts/analysis/eval_grpo.py --help
+python scripts/analysis/analyze_failure_modes.py --help
+python scripts/analysis/analyze_best_guess_vs_gold.py --help
+python scripts/analysis/compare_v4_v5_results.py
+python scripts/analysis/prune_checkpoints_for_inference.py --help
+```
+
+## 7. Past 코드
+
+사용하지 않는 과거 코드는 `scripts/past/`로 분리했습니다.
+
+- `scripts/past/evaluate_past.py` (기존 `evaluate_medqa.py`)
+- `scripts/past/run_gpt_ablation.py`
+- `scripts/past/run_ablation_gpu*.sh`
+- `scripts/past/run_rag.py`, `scripts/past/test_rag.py`
+- `scripts/past/etc/*`

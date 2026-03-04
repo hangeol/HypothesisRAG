@@ -1,137 +1,17 @@
-# GRPO Training for Rewriter
+# README_GRPO (Archived)
 
-Train the Rewriter (query generator) with Group Relative Policy Optimization using `trl.GRPOTrainer`, while keeping Planner and Generator frozen.
+이 문서는 과거 버전의 GRPO 가이드였습니다.  
+최신 경로/명령은 메인 README를 사용하세요.
 
-## Architecture
+- 최신 통합 문서: `README.md`
+- 학습 래퍼: `scripts/train/run_training.sh`
+- 평가 스크립트: `scripts/evaluate/evaluate.py`
+- 체크포인트 평가: `scripts/evaluate/evaluate_checkpoints.py`
+- 분석 스크립트: `scripts/analysis/*`
 
-```
-Question + Options
-       │
-       ▼
-  Frozen Planner (vLLM)  ──→  Plan JSON
-       │
-       ▼
-  ┌─ Rewriter (LoRA) ──→  3 Search Queries ─┐ ← trained
-  │                                          │
-  │  (G completions sampled per prompt)      │
-  │                                          │
-  │  Retriever (MedCPT)  ←──────────────────┘
-  │       │
-  │       ▼
-  │  Retrieved Documents
-  │       │
-  │       ▼
-  │  Frozen Generator (vLLM)  ──→  Answer
-  │       │
-  │       ▼
-  └── Reward = 1 if correct, 0 if wrong
-```
-
-Only the Rewriter's LoRA adapter parameters are updated. All other model weights remain frozen.
-
-## Quick Start
-
-### 1. Install Dependencies
+## 빠른 예시
 
 ```bash
-pip install trl==0.28.0 vllm==0.12.0 "numpy<2.0.0" peft transformers datasets accelerate bitsandbytes wandb
+bash scripts/train/run_training.sh --mode rewriter --gpus 0,1,2 --num_vllm_gpus 1 --num_train_gpus 2
+python scripts/evaluate/evaluate.py --mode hypothesis --llm-provider vllm --model Qwen/Qwen3-4B-Instruct-2507
 ```
-
-**Important - MedRAG Connectivity:**
-To ensure the pipeline successfully connects to the local MedRAG retrieval modules, you must add the absolute paths to your `PYTHONPATH` before executing the Python scripts. Alternatively, you can use the `run_training.sh` wrapper which handles this automatically:
-
-```bash
-export PYTHONPATH=$PYTHONPATH:$(pwd)/MIRAGE:$(pwd)/MIRAGE/MedRAG:$(pwd)/MIRAGE/MedRAG/src
-```
-
-### 2. Train
-
-```bash
-# Full fine-tuning (default)
-./run_training.sh \
-    --num_vllm_gpus 1 \
-    --num_train_gpus 2 \
-    --base_model Qwen/Qwen3-4B-Instruct-2507 \
-    --adapter_out_dir outputs/rewriter_grpo_full \
-    --retriever_name MedCPT \
-    --corpus_name Textbooks
-
-# Or with LoRA enabled
-./run_training.sh \
-    --num_vllm_gpus 1 \
-    --num_train_gpus 2 \
-    --base_model Qwen/Qwen3-4B-Instruct-2507 \
-    --adapter_out_dir outputs/rewriter_grpo_lora \
-    --use_lora \
-    --retriever_name MedCPT \
-    --corpus_name Textbooks
-```
-
-### 3. Dry Run (validate pipeline without GPU training)
-
-```bash
-python training/train_rewriter_grpo.py \
-    --base_model Qwen/Qwen3-4B-Instruct-2507 \
-    --dry_run
-```
-
-### 4. Evaluate
-
-Compare baseline rewriter vs GRPO-trained rewriter:
-
-```bash
-# Standalone comparison script
-python scripts/eval_grpo.py \
-    --adapter_path outputs/rewriter_grpo_lora \
-    --base_model Qwen/Qwen3-4B-Instruct-2507 \
-    -n 100
-
-# Or within the main evaluation framework
-python evaluate_medqa.py \
-    --modes planning_v4 planning_v4_grpo \
-    --llm-provider vllm \
-    --model google/gemma-2-9b-it \
-    --rewriter-adapter-path outputs/rewriter_grpo_lora \
-    -n 100
-```
-
-## File Structure
-
-```
-training/
-├── __init__.py
-├── train_rewriter_grpo.py   # Main entrypoint (uses trl.GRPOTrainer)
-└── reward.py                # Custom reward function (retriever + vLLM generator)
-
-models/
-├── __init__.py
-└── rewriter.py              # LoRA configuration
-
-data/
-├── __init__.py
-└── medqa_loader.py          # Dataset builder with vLLM plan pre-generation
-
-scripts/
-└── eval_grpo.py             # Standalone baseline vs GRPO comparison
-```
-
-## Key Design Decisions
-
-1. **TRL GRPOTrainer** — No manual GRPO implementation; uses the official `trl.GRPOTrainer` directly
-2. **vLLM for frozen inference** — Planner (plan pre-generation) and Generator (reward computation) both use vLLM for fast batched inference
-3. **Plan caching** — Plans are pre-generated before training and cached to disk to avoid regeneration each epoch
-4. **Reward = accuracy** — Binary reward: 1.0 if the generator's answer matches the gold answer, 0.0 otherwise
-5. **Single base model** — Planner, Generator, and Rewriter share the same base model weights; only the Rewriter has a LoRA adapter
-
-## Hyperparameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `group_size` | 8 | Completions per prompt (G) |
-| `beta_kl` | 0.02 | KL regularization |
-| `epsilon_clip` | 0.2 | PPO clip range |
-| `learning_rate` | 5e-6 | AdamW LR |
-| `lora_r` | 16 | LoRA rank |
-| `lora_alpha` | 32 | LoRA alpha |
-| `max_completion_length` | 256 | Max rewriter output tokens |
-| `warmup_ratio` | 0.05 | LR warmup |

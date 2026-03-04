@@ -20,10 +20,14 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 
-# Add parent directory to path to find rag_core
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add project root to path
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from rag_core import create_rag_compare_graph, RAGCompareGraph, MIRAGE_SYSTEM_PROMPT
+from core.rag_core import create_rag_compare_graph, RAGCompareGraph, MIRAGE_SYSTEM_PROMPT
 
 
 # ============================================================================

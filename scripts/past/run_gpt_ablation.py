@@ -15,9 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from prompts import HYPOTHESIS_PROMPTS, REWRITING_PROMPTS, GENERATOR_PROMPTS
+from core.prompts import HYPOTHESIS_PROMPTS, REWRITING_PROMPTS, GENERATOR_PROMPTS
 
 
 # ============================================================================
@@ -29,7 +32,7 @@ DEFAULT_CONCURRENCY = 120
 DEFAULT_MODELS = ["gpt-4o-mini", "gpt-4o"]
 DEFAULT_COMBOS = ["v5-v5", "v7-v10"]
 DEFAULT_GENERATOR_PROMPT = "v1"
-DEFAULT_OUTPUT_DIR = "outputs"
+DEFAULT_OUTPUT_DIR = None
 DEFAULT_RETRIEVER = "MedCPT"
 DEFAULT_CORPUS = "Textbooks"
 MAX_RETRIES = 3
@@ -48,24 +51,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--combos", nargs="+", default=DEFAULT_COMBOS,
                         help="Prompt combos in hv-rv format, e.g. v5-v5 v7-v10")
     parser.add_argument("--generator-prompt", type=str, default=DEFAULT_GENERATOR_PROMPT, choices=["v1", "v2"])
-    parser.add_argument("--output-dir", "-o", type=str, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        type=str,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Optional base output directory. If omitted, uses outputs/results/openai/<model>/",
+    )
     parser.add_argument("--retriever", type=str, default=DEFAULT_RETRIEVER)
     parser.add_argument("--corpus", type=str, default=DEFAULT_CORPUS)
     return parser.parse_args()
 
 
 def resolve_benchmark_path(explicit_path: Optional[str]) -> str:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         explicit_path,
-        os.path.join(script_dir, "MIRAGE", "benchmark.json"),
-        os.path.join(script_dir, "data", "benchmark.json"),
-        os.path.join(script_dir, "..", "MIRAGE", "benchmark.json"),
+        os.path.join(PROJECT_ROOT, "MIRAGE", "benchmark.json"),
+        os.path.join(PROJECT_ROOT, "data", "benchmark.json"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
             return path
     raise FileNotFoundError("benchmark.json not found. Use --benchmark-path to specify it.")
+
+
+def _slugify(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_")
+    return value or "model"
+
+
+def resolve_model_output_dir(output_dir: Optional[str], model_name: str) -> str:
+    base = output_dir or os.path.join(PROJECT_ROOT, "outputs")
+    return os.path.join(base, "results", "openai", _slugify(model_name))
 
 
 def maybe_load_api_key_from_bashrc() -> Optional[str]:
@@ -258,7 +275,7 @@ async def run_evaluation(
     questions: List[Dict[str, Any]],
     concurrency: int,
     generator_prompt: str,
-    output_dir: str,
+    output_dir: Optional[str],
     retriever_name: str,
     corpus_name: str,
 ) -> Tuple[str, float]:
@@ -349,7 +366,7 @@ async def run_evaluation(
 
         # Phase 3: Retrieval
         print(f"  Phase 3: Retrieval ({retriever_name}/{corpus_name})")
-        from retriever import create_retriever
+        from retrieval.retriever import create_retriever
 
         retriever = create_retriever(
             retriever_type="mirage",
@@ -458,10 +475,11 @@ async def run_evaluation(
 
         print(f"\n  [{tag}] {accuracy:.2f}% ({correct}/{len(questions)}) in {elapsed:.0f}s")
 
-        os.makedirs(output_dir, exist_ok=True)
+        model_output_dir = resolve_model_output_dir(output_dir, model_name)
+        os.makedirs(model_output_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         outfile = os.path.join(
-            output_dir,
+            model_output_dir,
             f"medqa_{model_name.replace('/', '_')}_hv{hv}_rv{rv}_gv{generator_prompt}_{timestamp}.json",
         )
         with open(outfile, "w", encoding="utf-8") as f:

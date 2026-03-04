@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Orchestrate GRPO checkpoint evaluation on MedQA.
+Orchestrate GRPO checkpoint evaluation on MedQA (evaluate.py backend).
 
 Thin wrapper: discovers checkpoints, assigns GPUs, and launches
-evaluate_medqa.run_batch_phased_evaluation() in a separate process
+evaluate.run_batch_phased_evaluation() in a separate process
 per GPU. Each GPU processes checkpoints sequentially.
 
 Supports TWO modes (auto-detected from hyperparameters.json):
@@ -11,17 +11,6 @@ Supports TWO modes (auto-detected from hyperparameters.json):
   hypothesis — checkpoint used in Phase 1 (generate diagnostic plan)
 
 Only one model on GPU at a time → full vLLM batch throughput.
-
-Usage:
-  # Rewriter checkpoints (auto-detected)
-  python evaluate_checkpoints.py \\
-    outputs/rewriter_grpo_lora/20260224_014411 \\
-    --gpus 3,4,5 --max-questions 1273
-
-  # Hypothesis checkpoints (auto-detected)
-  python evaluate_checkpoints.py \\
-    outputs/hypothesis_grpo_lora/20260225_012054 \\
-    --gpus 3,4,5 --max-questions 1273
 """
 
 import argparse
@@ -36,10 +25,16 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 # ── Project paths ────────────────────────────────────────────────────────────
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 
-for sub in ["", "MIRAGE", "MIRAGE/MedRAG", "MIRAGE/MedRAG/src"]:
-    p = os.path.join(PROJECT_ROOT, sub) if sub else PROJECT_ROOT
+for p in [
+    SCRIPT_DIR,
+    PROJECT_ROOT,
+    os.path.join(PROJECT_ROOT, "MIRAGE"),
+    os.path.join(PROJECT_ROOT, "MIRAGE", "MedRAG"),
+    os.path.join(PROJECT_ROOT, "MIRAGE", "MedRAG", "src"),
+]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -57,6 +52,16 @@ def discover_checkpoints(training_dir: str, every_n: int = 1) -> list:
     if every_n > 1:
         ckpt_dirs = [(s, p) for s, p in ckpt_dirs if s % every_n == 0]
     return ckpt_dirs
+
+
+def is_valid_model_checkpoint_dir(path: str) -> bool:
+    """Returns True if checkpoint dir looks loadable by HF/vLLM."""
+    if not os.path.isdir(path):
+        return False
+    names = set(os.listdir(path))
+    return any(
+        key in names for key in ["config.json", "params.json", "adapter_config.json"]
+    )
 
 
 def read_hyperparameters(training_dir: str) -> dict:
@@ -133,6 +138,10 @@ def gpu_worker(
     hypothesis_checkpoint: Optional[str] = None,
     rewriter_checkpoint: Optional[str] = None,
     generator_checkpoint: Optional[str] = None,
+    hypothesis_prompt: str = "v1",
+    rewriting_prompt: str = "v1",
+    generator_prompt: str = "v1",
+    vllm_tensor_parallel_size: int = 1,
 ):
     """
     Worker process for one GPU.
@@ -143,7 +152,7 @@ def gpu_worker(
     print(f"{tag} Worker started (PID {os.getpid()}, mode={mode})")
 
     # Late import (after CUDA_VISIBLE_DEVICES is set)
-    from evaluate_medqa import run_batch_phased_evaluation
+    from evaluate import run_batch_phased_evaluation
 
     effective_gpu_mem = _resolve_gpu_mem(gpu_mem, tag)
 
@@ -162,9 +171,13 @@ def gpu_worker(
                 max_questions=max_questions,
                 total_docs=total_docs,
                 gpu_mem=effective_gpu_mem,
+                vllm_tensor_parallel_size=vllm_tensor_parallel_size,
                 max_model_len=max_model_len,
                 max_tokens=max_tokens,
                 output_dir=out_dir,
+                hypothesis_prompt=hypothesis_prompt,
+                rewriting_prompt=rewriting_prompt,
+                generator_prompt=generator_prompt,
             )
             if mode == "hypothesis":
                 kwargs["hypothesis_checkpoint"] = ckpt_path
@@ -207,9 +220,16 @@ def generate_summary(training_dir, checkpoints, results_base, total_time=None):
         with open(os.path.join(d, jf[-1])) as f:
             data = json.load(f)
         s = data.get("summary", {})
-        mr = s.get("mode_results", {}).get("planning_v4_grpo", {})
+        mode_results = s.get("mode_results", {}) or {}
+        if mode_results:
+            mode_key = next(iter(mode_results.keys()))
+            mr = mode_results.get(mode_key, {})
+        else:
+            mode_key = "unknown"
+            mr = {}
         all_res.append({
             "step": step,
+            "mode": mode_key,
             "accuracy": mr.get("accuracy", 0),
             "correct": mr.get("correct", 0),
             "total": mr.get("total", 0),
@@ -223,7 +243,7 @@ def generate_summary(training_dir, checkpoints, results_base, total_time=None):
     csv_path = os.path.join(results_base, "checkpoint_summary.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
-            "step", "accuracy", "correct", "total", "time_seconds"])
+            "step", "mode", "accuracy", "correct", "total", "time_seconds"])
         w.writeheader()
         w.writerows(all_res)
 
@@ -271,6 +291,15 @@ def main():
                         help="GPU memory utilization (default: 0.9)")
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--hypothesis-prompt", type=str, default=None,
+                        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'])
+    parser.add_argument("--rewriting-prompt", type=str, default=None,
+                        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'])
+    parser.add_argument("--generator-prompt", type=str, default=None,
+                        choices=['v1', 'v2'])
+    parser.add_argument("--results-subdir", type=str, default="results_v2",
+                        help="Results directory name under training_dir (default: results_v2)")
     # Per-module checkpoint overrides (fixed, not iterated)
     parser.add_argument("--hypothesis-checkpoint", type=str, default=None,
                         help="Fixed hypothesis checkpoint (when mode=rewriter)")
@@ -284,23 +313,42 @@ def main():
     hparams = read_hyperparameters(training_dir)
     base_model = hparams["base_model"]
     mode = args.mode if args.mode else detect_mode(hparams)
+    hypothesis_prompt = args.hypothesis_prompt or hparams.get("hypothesis_prompt", "v1")
+    rewriting_prompt = args.rewriting_prompt or hparams.get("rewriting_prompt", "v1")
+    generator_prompt = args.generator_prompt or hparams.get("generator_prompt", "v1")
 
     print(f"Base model: {base_model}")
     print(f"Mode: {mode}")
+    print(f"Prompts: hypothesis={hypothesis_prompt}, rewriting={rewriting_prompt}, generator={generator_prompt}")
 
     checkpoints = discover_checkpoints(training_dir, args.every_n)
     if not checkpoints:
         print("No checkpoints found.")
         sys.exit(1)
 
-    results_base = os.path.join(training_dir, "results")
-    pending = [(s, p) for s, p in checkpoints
+    valid, invalid = [], []
+    for step, path in checkpoints:
+        if is_valid_model_checkpoint_dir(path):
+            valid.append((step, path))
+        else:
+            invalid.append((step, path))
+
+    if invalid:
+        bad_steps = [s for s, _ in invalid]
+        print(f"Skipping {len(invalid)} invalid checkpoints (no model files): {bad_steps}")
+
+    if not valid:
+        print("No valid checkpoints found.")
+        sys.exit(1)
+
+    results_base = os.path.join(training_dir, args.results_subdir)
+    pending = [(s, p) for s, p in valid
                if not is_checkpoint_done(results_base, s)]
 
-    print(f"Checkpoints: {len(checkpoints)} total, "
-          f"{len(checkpoints)-len(pending)} done, {len(pending)} pending")
+    print(f"Checkpoints: {len(valid)} valid, "
+          f"{len(valid)-len(pending)} done, {len(pending)} pending")
     if not pending:
-        generate_summary(training_dir, checkpoints, results_base)
+        generate_summary(training_dir, valid, results_base)
         sys.exit(0)
 
     gpu_ids = [int(g.strip()) for g in args.gpus.split(",")]
@@ -327,7 +375,9 @@ def main():
                   args.max_questions, args.total_docs, args.gpu_mem,
                   args.max_model_len, args.max_tokens,
                   mode, args.hypothesis_checkpoint,
-                  args.rewriter_checkpoint, args.generator_checkpoint),
+                  args.rewriter_checkpoint, args.generator_checkpoint,
+                  hypothesis_prompt, rewriting_prompt, generator_prompt,
+                  args.vllm_tensor_parallel_size),
         )
         processes.append(p)
         p.start()
@@ -341,7 +391,7 @@ def main():
             p.terminate()
 
     total_time = time.time() - t0
-    generate_summary(training_dir, checkpoints, results_base, total_time)
+    generate_summary(training_dir, valid, results_base, total_time)
 
 
 if __name__ == "__main__":

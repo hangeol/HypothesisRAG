@@ -1,7 +1,7 @@
 import sys
 sys.path.append("/home/bispl_02/hangeol/HypothesisRAG")
 try:
-    from retriever import create_retriever
+    from retrieval.retriever import create_retriever
     retriever = create_retriever("mirage", "MedCPT", "Textbooks")
     docs, _ = retriever.retrieve("What is a headache?", k=1)
     if not docs:
