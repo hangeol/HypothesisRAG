@@ -193,7 +193,7 @@ def parse_args():
         help="Run 5 questions with G=2, no weight updates — validate pipeline"
     )
 
-    # Prompt version selection (matches evaluate_medqa_v2.py)
+    # Prompt version selection (matches scripts/evaluate/evaluate.py)
     parser.add_argument(
         "--hypothesis_prompt", type=str, default="v6",
         help="Hypothesis prompt version for plan generation (default: v6)"
@@ -214,7 +214,7 @@ def check_rag_connection(retriever_name: str, corpus_name: str):
     import sys
     print("\n[0/3] Checking RAG connection...")
     try:
-        from retriever import create_retriever
+        from retrieval.retriever import create_retriever
         retriever_instance = create_retriever(
             retriever_type="mirage",
             retriever_name=retriever_name,

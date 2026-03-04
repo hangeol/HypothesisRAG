@@ -7,7 +7,7 @@ Runs MedQA evaluation on N questions comparing:
   (b) planning_v4_grpo (trained rewriter with LoRA adapter)
 
 Usage:
-    python scripts/eval_grpo.py \
+    python scripts/analysis/eval_grpo.py \
         --adapter_path outputs/rewriter_grpo_lora \
         --base_model google/gemma-2-9b-it \
         --n 50 \
@@ -22,7 +22,9 @@ import argparse
 import re
 from typing import Dict, List, Any, Optional
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 sys.path.insert(0, _PROJECT_ROOT)
 
 
@@ -127,7 +129,7 @@ def main():
     # 2. Initialize retriever + generator
     # ====================================================================
     print("\n[2/5] Initializing retriever and generator...")
-    from retriever import create_retriever
+    from retrieval.retriever import create_retriever
     retriever = create_retriever(
         retriever_type="mirage",
         retriever_name=args.retriever_name,

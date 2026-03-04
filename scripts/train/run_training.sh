@@ -3,16 +3,21 @@
 #
 # Usage examples:
 #   # Use GPUs 0,1,2,3,4 (1 for vLLM, 4 for training)
-#   bash run_training.sh --gpus 0,1,2,3,4 --num_vllm_gpus 1 --num_train_gpus 4
+#   bash scripts/train/run_training.sh --gpus 0,1,2,3,4 --num_vllm_gpus 1 --num_train_gpus 4
 #
 #   # Use GPUs 6,7 (1 for vLLM, 1 for training) for either rewriter or hypothesis mode
-#   bash run_training.sh --gpus 6,7 --num_vllm_gpus 1 --num_train_gpus 1
+#   bash scripts/train/run_training.sh --gpus 6,7 --num_vllm_gpus 1 --num_train_gpus 1
 
 #   # Hypothesis-only training mode (planner + final-answer reward)
-#   bash run_training.sh --mode hypothesis --gpus 0,1,2 --num_vllm_gpus 1 --num_train_gpus 2 \
+#   bash scripts/train/run_training.sh --mode hypothesis --gpus 0,1,2 --num_vllm_gpus 1 --num_train_gpus 2 \
 #       --per_device_bs 1 --total_batch_size 32 --group_size 8 \
 #       --hypothesis_prompt v7 --rewriting_prompt v10 --generator_prompt v1 \
 #       --base_model Qwen/Qwen3-4B-Instruct-2507
+
+# Resolve project root from this script location.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "$PROJECT_ROOT"
 
 # Default settings
 TRAINING_MODE="rewriter"

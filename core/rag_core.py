@@ -22,15 +22,22 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+# Project paths
+_CORE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_CORE_DIR, ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 # Import existing retriever
-sys.path.insert(0, os.path.dirname(__file__))
-from retriever import MIRAGERetriever, create_retriever
+from retrieval.retriever import MIRAGERetriever, create_retriever
 
 # Import MIRAGE prompt template (try multiple paths)
 MIRAGE_SYSTEM_PROMPT = '''You are a helpful medical expert, and your task is to answer a multi-choice medical question using the relevant documents. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
 
 try:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'MIRAGE', 'MedRAG', 'src'))
+    mirage_src = os.path.join(_PROJECT_ROOT, 'MIRAGE', 'MedRAG', 'src')
+    if mirage_src not in sys.path:
+        sys.path.insert(0, mirage_src)
     from template import general_medrag_system
     MIRAGE_SYSTEM_PROMPT = general_medrag_system
     print("✓ Loaded MIRAGE system prompt from template.py")

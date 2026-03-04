@@ -12,10 +12,10 @@ from typing import List, Dict, Any, Tuple, Optional
 from abc import ABC, abstractmethod
 
 # Add MIRAGE paths for retrieval
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_BASE_DIR, 'MIRAGE'))
-sys.path.insert(0, os.path.join(_BASE_DIR, 'MIRAGE', 'MedRAG'))
-sys.path.insert(0, os.path.join(_BASE_DIR, 'MIRAGE', 'MedRAG', 'src'))
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'MIRAGE'))
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'MIRAGE', 'MedRAG'))
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, 'MIRAGE', 'MedRAG', 'src'))
 
 
 class BaseRetriever(ABC):
@@ -88,7 +88,7 @@ class MIRAGERetriever(BaseRetriever):
         """
         self.retriever_name = retriever_name
         self.corpus_name = corpus_name
-        self.db_dir = db_dir or os.path.join(_BASE_DIR, 'MIRAGE', 'MedRAG', 'corpus')
+        self.db_dir = db_dir or os.path.join(_PROJECT_ROOT, 'MIRAGE', 'MedRAG', 'corpus')
         self.cache = cache
         self.HNSW = HNSW
         
@@ -306,4 +306,3 @@ if __name__ == "__main__":
         print(f"\n[{i+1}] Score: {score:.4f}")
         print(f"    Title: {doc.get('title', 'N/A')}")
         print(f"    Content: {doc.get('content', 'N/A')[:200]}...")
-

@@ -1,5 +1,6 @@
 corpus/*
 results/*
+logs/*
 MIRAGE/MedRAG/cache/*
 MIRAGE/MedRAG/corpus/*
 MIRAGE/prediction/*

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-MedQA Evaluation for RAG Comparison Experiment (Async Parallel Version)
+MedQA Evaluation v2 – Prompt-Selectable Ablation System
 
-This script evaluates different RAG modes on MedQA testset
-with maximum async parallel execution for fastest processing.
+Modes:
+  cot       : Chain-of-Thought (no RAG)
+  directrag : 1 query × total_docs
+  directrewriting: 3 sub-queries × 5 docs/query (=15 docs)
+  hypothesis: Hypothesis→Rewrite→Retrieve→Answer (4-phase batch)
 
-Evaluation Modes:
-- cot: Chain-of-Thought baseline (no RAG, just LLM reasoning)
-- direct: 1 query × total_docs documents
-- baseline: 5 queries × (total_docs/5) documents per query
-- planning_v4: 3 queries × (total_docs/3) documents per query
-All RAG modes retrieve the same total number of documents (default: 15)
+For hypothesis mode, select prompt versions:
+  --hypothesis-prompt  v1 | v2 | v3
+  --rewriting-prompt   v1 | v2 | v3
+  --generator-prompt   v1 | v2
+  --run-all  runs all 9 hypothesis×rewriting combos (generator=v1)
 """
 
 import os
@@ -26,11 +28,23 @@ from tqdm.asyncio import tqdm_asyncio
 from tqdm import tqdm
 import aiohttp
 
-# Add current directory to path
-# Add current directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+# Project paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+for p in [
+    PROJECT_ROOT,
+    os.path.join(PROJECT_ROOT, "MIRAGE"),
+    os.path.join(PROJECT_ROOT, "MIRAGE", "MedRAG"),
+    os.path.join(PROJECT_ROOT, "MIRAGE", "MedRAG", "src"),
+]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from retriever import create_retriever
+from retrieval.retriever import create_retriever
+from core.prompts import (
+    load_mirage_prompts,
+    get_evaluate_prompt_bundle,
+)
 
 
 RETRIEVAL_DATASET_TO_CORPUS = {
@@ -52,244 +66,142 @@ def parse_retrieval_dataset(value: str) -> str:
         )
     return RETRIEVAL_DATASET_TO_CORPUS[normalized]
 
-# ============================================================================
-# Prompts from MIRAGE template.py
-# ============================================================================
-# CoT (Chain-of-Thought) - No RAG
-COT_SYSTEM_PROMPT = '''You are a helpful medical expert, and your task is to answer a multi-choice medical question. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
 
-# RAG (with documents)
-MIRAGE_SYSTEM_PROMPT = '''You are a helpful medical expert, and your task is to answer a multi-choice medical question using the relevant documents. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
+def _slugify(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("_")
+    return value or "model"
 
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'MIRAGE', 'MedRAG', 'src'))
-    from template import general_medrag_system, general_cot_system
-    MIRAGE_SYSTEM_PROMPT = general_medrag_system
-    COT_SYSTEM_PROMPT = general_cot_system
+
+def resolve_results_output_dir(
+    output_dir: Optional[str],
+    llm_provider: str,
+    model_name: str,
+) -> str:
+    """Auto-route results under outputs/results/<provider>/<model>/ if not specified."""
+    if output_dir:
+        return output_dir
+    provider = "openai" if llm_provider == "openai" else "local"
+    return os.path.join(
+        PROJECT_ROOT,
+        "outputs",
+        "results",
+        provider,
+        _slugify(model_name),
+    )
+
+
+def resolve_ablation_summary_dir(
+    output_dir: Optional[str],
+    llm_provider: str,
+) -> str:
+    if output_dir:
+        return output_dir
+    provider = "openai" if llm_provider == "openai" else "local"
+    return os.path.join(PROJECT_ROOT, "outputs", "results", provider, "ablation")
+
+
+def parse_ablation_combo_tokens(
+    tokens: List[str],
+    default_generator_prompt: str,
+) -> List[Tuple[str, str, str]]:
+    combos: List[Tuple[str, str, str]] = []
+    for token in tokens:
+        parts = token.split("-")
+        if len(parts) == 2:
+            hv, rv = parts
+            gv = default_generator_prompt
+        elif len(parts) == 3:
+            hv, rv, gv = parts
+        else:
+            raise ValueError(
+                f"Invalid combo '{token}'. Use 'vH-vR' or 'vH-vR-vG' "
+                f"(e.g., v5-v5 or v7-v10-v2)."
+            )
+        if hv not in HYPOTHESIS_PROMPTS:
+            raise ValueError(f"Unknown hypothesis prompt: {hv}")
+        if rv not in REWRITING_PROMPTS:
+            raise ValueError(f"Unknown rewriting prompt: {rv}")
+        if gv not in GENERATOR_PROMPTS:
+            raise ValueError(f"Unknown generator prompt: {gv}")
+        combos.append((hv, rv, gv))
+    return combos
+
+
+def resolve_openai_api_key() -> Optional[str]:
+    """Resolve OPENAI_API_KEY from env, with ~/.bashrc fallback."""
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+
+    bashrc_path = os.path.expanduser("~/.bashrc")
+    if not os.path.exists(bashrc_path):
+        return None
+
+    try:
+        text = open(bashrc_path, "r", encoding="utf-8").read()
+    except Exception:
+        return None
+
+    patterns = [
+        r'export\s+OPENAI_API_KEY\s*=\s*"([^"]+)"',
+        r"export\s+OPENAI_API_KEY\s*=\s*'([^']+)'",
+        r"export\s+OPENAI_API_KEY\s*=\s*([^\s#]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).strip()
+    return None
+
+# Keep system prompts aligned with MIRAGE template when available.
+# This avoids divergence between local copied prompts and MIRAGE upstream text.
+if load_mirage_prompts():
     print("✓ Loaded MIRAGE prompts from template.py")
-except ImportError:
-    print("⚠ Using built-in MIRAGE prompts")
+else:
+    print("⚠ Using built-in prompts")
+
+# Resolve all prompt resources from a single bundle.
+PROMPT_BUNDLE = get_evaluate_prompt_bundle()
+HYPOTHESIS_PROMPTS = PROMPT_BUNDLE["hypothesis"]
+REWRITING_PROMPTS = PROMPT_BUNDLE["rewriter"]
+GENERATOR_PROMPTS = PROMPT_BUNDLE["generator"]
+COT_SYSTEM_PROMPT = PROMPT_BUNDLE["system"]["cot"]
+MIRAGE_SYSTEM_PROMPT = PROMPT_BUNDLE["system"]["medrag"]
+COT_USER_PROMPT_TEMPLATE = PROMPT_BUNDLE["answer"]["cot_user"]
+MEDRAG_USER_PROMPT_TEMPLATE = PROMPT_BUNDLE["answer"]["medrag_user"]
+DIRECT_REWRITING_SYSTEM_PROMPT = PROMPT_BUNDLE["baseline"]["direct_rewriting_system"]
+DIRECT_REWRITING_PROMPT = PROMPT_BUNDLE["baseline"]["direct_rewriting_user"]
+DIRECT_REWRITING_TARGET_QUERIES = int(
+    PROMPT_BUNDLE["baseline"]["direct_rewriting_num_queries"]
+)
+DIRECT_REWRITING_DOCS_PER_QUERY = int(
+    PROMPT_BUNDLE["baseline"]["direct_rewriting_docs_per_query"]
+)
+DIRECT_REWRITING_TOTAL_DOCS = (
+    DIRECT_REWRITING_TARGET_QUERIES * DIRECT_REWRITING_DOCS_PER_QUERY
+)
+PLANNING_PROMPT = PROMPT_BUNDLE["baseline"]["planning_user"]
 
 
-# ============================================================================
-# Multi-Query Rewriting Prompt (5 queries version)
-# ============================================================================
-MULTI_QUERY_PROMPT_5 = """You are an AI language model assistant. Your task
-is to generate exactly five different versions of the
-given user question to retrieve relevant documents
-from a vector database. By generating multiple
-perspectives on the user question, your goal is to
-help the user overcome some of the limitations of
-the distance-based similarity search.
-Original question: {query}
-Format your response in plain text as:
-Sub-query 1:
-Sub-query 2:
-Sub-query 3:
-Sub-query 4:
-Sub-query 5:"""
+MODE_ALIASES = {
+    "direct": "directrag",
+    "baseline": "directrewriting",
+}
 
-PLANNING_PROMPT = """Analyze the following medical question and extract key information.
 
-Question: {question}
+def normalize_mode_name(mode: str) -> str:
+    return MODE_ALIASES.get(mode, mode)
 
-Extract:
-1. observed_features: List 3-7 key symptoms, findings, or conditions mentioned
-2. must_check_cooccurrence: List pairs of features whose co-occurrence is important
-3. need_disambiguation: List any confusing concepts that need distinction
 
-Output in JSON format:
-{{"observed_features": [...], "must_check_cooccurrence": [[...]], "need_disambiguation": [...]}}"""
-
-# ============================================================================
-# IMPROVED Planning V2 Prompts
-# ============================================================================
-PLANNING_V2_PROMPT = """You are a medical expert. Analyze this clinical question and provide a diagnostic reasoning plan.
-
-Question: {question}
-
-Options:
-{options}
-
-Provide your analysis in JSON format:
-{{
-    "key_clinical_features": ["list 3-5 most important clinical clues from the question"],
-    "primary_diagnosis_hypothesis": "most likely diagnosis based on the features",
-    "differential_diagnoses": ["2-3 alternative diagnoses to consider"],
-    "distinguishing_features": ["specific findings that would differentiate between diagnoses"],
-    "search_strategy": "brief explanation of what information would be most helpful to find"
-}}"""
-
-PLANNING_V2_QUERY_PROMPT = """Based on the clinical analysis, generate 5 specific medical search queries to find evidence.
-
-Clinical Question: {question}
-
-Analysis:
-- Key Features: {key_features}
-- Primary Hypothesis: {primary_diagnosis}
-- Differential Diagnoses: {differentials}
-- Distinguishing Features: {distinguishing}
-
-Generate 5 targeted queries that will help differentiate between the diagnoses:
-Query 1: Search for the PRIMARY diagnosis with key symptoms
-Query 2: Search for DIFFERENTIAL diagnosis comparison
-Query 3: Search for DISTINGUISHING lab/imaging/clinical findings
-Query 4: Search for PATHOPHYSIOLOGY of the most likely condition
-Query 5: Search for TREATMENT or MANAGEMENT approach
-
-Format:
-Query 1: [your query]
-Query 2: [your query]
-Query 3: [your query]
-Query 4: [your query]
-Query 5: [your query]"""
-
-# ============================================================================
-# IMPROVED Planning V3 Prompts - Adaptive Query Generation
-# ============================================================================
-PLANNING_V3_PROMPT = """You are an expert medical diagnostician. Analyze this clinical question and create a focused diagnostic plan.
-
-Question: {question}
-
-Options:
-{options}
-
-Provide your analysis in JSON format:
-{{
-    "question_type": "factual|diagnostic|mechanism|treatment|comparison",
-    "complexity": "simple|moderate|complex",
-    "key_clinical_clues": ["list 2-4 most critical clinical findings"],
-    "most_likely_answer": "A/B/C/D with brief reasoning",
-    "confidence": "high|medium|low",
-    "what_evidence_needed": ["list specific information that would confirm the answer"],
-    "differential_if_uncertain": ["only if confidence is low, list alternatives to consider"]
-}}
-
-Be concise and focused. Identify the most discriminating features."""
-
-PLANNING_V3_QUERY_PROMPT = """You are a medical search expert. Generate the MINIMUM number of highly specific search queries needed to answer this question.
-
-Question: {question}
-
-Analysis:
-- Question Type: {question_type}
-- Complexity: {complexity}
-- Key Clues: {key_clues}
-- Most Likely Answer: {likely_answer}
-- Evidence Needed: {evidence_needed}
-{differential_section}
-
-IMPORTANT RULES:
-1. Generate ONLY the queries that are truly necessary (minimum 2, maximum 7)
-2. Each query must be highly specific and targeted
-3. For simple/factual questions, 2-3 queries are enough
-4. For complex differential diagnosis, use 4-6 queries
-5. DO NOT generate redundant or overlapping queries
-
-Generate your queries (only as many as needed):
-Query 1: [essential query for the most likely answer]
-Query 2: [query to verify/distinguish]
-... (add more only if necessary)"""
-
-# ============================================================================
-# Planning V4: Answer-Focused Approach with Evidence Verification
-# ============================================================================
-PLANNING_V4_PROMPT = """You are an expert medical diagnostician taking a medical licensing exam.
-
-Question: {question}
-
-Options:
-{options}
-
-Step 1: Identify the KEY DISCRIMINATING FEATURES that distinguish between the options.
-Step 2: Make your BEST GUESS for the answer based on medical knowledge.
-Step 3: Identify what SPECIFIC EVIDENCE would CONFIRM your answer.
-
-Output in JSON:
-{{
-    "discriminating_features": ["2-3 features that distinguish between options"],
-    "best_guess": "A/B/C/D",
-    "reasoning": "brief explanation why this is the best answer",
-    "confirming_evidence": ["1-3 specific facts that would confirm this answer"],
-    "alternative_if_wrong": "A/B/C/D - only if uncertain"
-}}"""
-
-PLANNING_V4_QUERY_PROMPT = """Generate 3 highly targeted search queries to find evidence for this medical question.
-
-Question: {question}
-Best Guess Answer: {best_guess}
-Reasoning: {reasoning}
-Evidence Needed: {confirming_evidence}
-Key Features: {discriminating_features}
-
-Generate 3 SPECIFIC queries:
-Query 1: Find evidence supporting {best_guess} - focus on the main reasoning
-Query 2: Find distinguishing criteria for differential diagnosis  
-Query 3: Find specific clinical/pathological features
-
-Format:
-Query 1: [query]
-Query 2: [query]
-Query 3: [query]"""
-
-# ============================================================================
-# Planning V6: Dual Hypothesis Testing Approach
-# ============================================================================
-PLANNING_V6_PROMPT = """You are an expert medical diagnostician. Analyze this question using differential diagnosis approach.
-
-Question: {question}
-
-Options:
-{options}
-
-Generate TWO most likely diagnostic hypotheses and plan how to verify each:
-
-Output in JSON:
-{{
-    "hypothesis_1": {{
-        "diagnosis": "Most likely answer (A/B/C/D)",
-        "key_reasoning": "Why this is most likely",
-        "supporting_features": ["2-3 clinical features that support this"],
-        "evidence_to_verify": ["Specific evidence that would confirm this hypothesis"]
-    }},
-    "hypothesis_2": {{
-        "diagnosis": "Second most likely answer (A/B/C/D)",
-        "key_reasoning": "Why this is also possible",
-        "supporting_features": ["2-3 clinical features that support this"],
-        "evidence_to_verify": ["Specific evidence that would confirm this hypothesis"]
-    }},
-    "discriminating_criteria": ["Key findings that distinguish between hypothesis 1 and 2"]
-}}"""
-
-PLANNING_V6_QUERY_PROMPT = """Generate 5-6 targeted search queries to verify both hypotheses.
-
-Question: {question}
-
-Hypothesis 1: {h1_diagnosis}
-- Reasoning: {h1_reasoning}
-- Evidence needed: {h1_evidence}
-
-Hypothesis 2: {h2_diagnosis}
-- Reasoning: {h2_reasoning}
-- Evidence needed: {h2_evidence}
-
-Discriminating criteria: {discriminating}
-
-Generate 5-6 queries:
-Query 1: Evidence for Hypothesis 1
-Query 2: Evidence for Hypothesis 2
-Query 3: Distinguishing features between H1 and H2
-Query 4: Confirming pathophysiology/mechanism
-Query 5: Clinical presentation comparison
-Query 6 (optional): Treatment/management differences
-
-Format:
-Query 1: [query]
-Query 2: [query]
-Query 3: [query]
-Query 4: [query]
-Query 5: [query]
-Query 6: [query if needed]"""""
+def normalize_mode_list(modes: List[str]) -> List[str]:
+    seen = set()
+    normalized = []
+    for mode in modes:
+        mapped = normalize_mode_name(mode)
+        if mapped not in seen:
+            seen.add(mapped)
+            normalized.append(mapped)
+    return normalized
 
 
 # ============================================================================
@@ -301,8 +213,8 @@ class MedQADataset:
     def __init__(self, benchmark_path: Optional[str] = None):
         if benchmark_path is None:
             possible_paths = [
-                os.path.join(os.path.dirname(__file__), "MIRAGE", "benchmark.json"),
-                os.path.join(os.path.dirname(__file__), "..", "MIRAGE", "benchmark.json"),
+                os.path.join(PROJECT_ROOT, "MIRAGE", "benchmark.json"),
+                os.path.join(PROJECT_ROOT, "data", "benchmark.json"),
                 "/mnt/data1/home/hangeol/project/MIRAGE/benchmark.json",
             ]
             for path in possible_paths:
@@ -373,7 +285,10 @@ def parse_answer(answer_text: str) -> str:
     return ""
 
 
-def parse_subqueries(content: str, num_queries: int = 5) -> List[str]:
+def parse_subqueries(
+    content: str,
+    num_queries: int = DIRECT_REWRITING_TARGET_QUERIES,
+) -> List[str]:
     """Parse sub-queries from LLM response"""
     queries = []
     
@@ -704,8 +619,13 @@ class AsyncRAGEvaluator:
             corpus_name=corpus_name,
         )
     
-    def retrieve_documents(self, queries: List[str], k_per_query: int) -> List[Dict[str, Any]]:
-        """Retrieve and fuse documents from multiple queries"""
+    def retrieve_documents(
+        self,
+        queries: List[str],
+        k_per_query: int,
+        max_docs: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve and fuse documents from multiple queries."""
         doc_scores = {}
         doc_data = {}
         
@@ -728,7 +648,7 @@ class AsyncRAGEvaluator:
         sorted_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
         
         retrieved_docs = []
-        for doc_id in sorted_ids[:25]:
+        for doc_id in sorted_ids[:max_docs]:
             doc = doc_data[doc_id]
             doc["fused_score"] = doc_scores[doc_id]
             retrieved_docs.append(doc)
@@ -762,9 +682,12 @@ class AsyncRAGEvaluator:
         question: str,
         plan: Optional[Dict] = None,
         session: aiohttp.ClientSession = None,
+        system_prompt: Optional[str] = None,
+        target_num_queries: Optional[int] = None,
     ) -> List[str]:
         """Generate subqueries asynchronously"""
-        
+        target_count = target_num_queries or self.num_subqueries
+
         if plan and plan.get("observed_features"):
             features = plan.get("observed_features", [])
             cooccurrence = plan.get("must_check_cooccurrence", [])
@@ -786,27 +709,78 @@ class AsyncRAGEvaluator:
         else:
             enhanced_query = question
         
-        prompt = MULTI_QUERY_PROMPT_5.format(query=enhanced_query)
-        
+        prompt = DIRECT_REWRITING_PROMPT.format(query=enhanced_query)
+        used_system_prompt = MIRAGE_SYSTEM_PROMPT if system_prompt is None else system_prompt
         messages = [
-            {"role": "system", "content": MIRAGE_SYSTEM_PROMPT},
+            {"role": "system", "content": used_system_prompt},
             {"role": "user", "content": prompt}
         ]
         
         response = await self.client.chat_completion(messages, session=session)
-        queries = parse_subqueries(response, self.num_subqueries)
-        
-        if len(queries) < 3:
-            words = re.findall(r'\b[A-Za-z]{4,}\b', question)
-            queries = [
-                question,
-                f"{' '.join(words[:3])} symptoms diagnosis" if words else question,
-                f"{' '.join(words[:3])} treatment" if words else question,
-                f"{' '.join(words[1:4])} medical" if len(words) > 1 else question,
-                f"{' '.join(words[:2])} pathophysiology" if len(words) > 1 else question,
-            ][:self.num_subqueries]
-        
-        return queries
+        queries = parse_subqueries(response, target_count)
+        return self._expand_queries_to_target(queries, question, target_count)
+
+    def _expand_queries_to_target(
+        self,
+        queries: List[str],
+        question: str,
+        target_count: int,
+    ) -> List[str]:
+        """Ensure deterministic query count by expanding with stable fallbacks."""
+        if target_count <= 0:
+            return []
+
+        cleaned: List[str] = []
+        seen = set()
+        for query in queries:
+            query_text = re.sub(r"\s+", " ", str(query)).strip()
+            if not query_text:
+                continue
+            key = query_text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(query_text)
+            if len(cleaned) >= target_count:
+                return cleaned[:target_count]
+
+        words = re.findall(r"\b[A-Za-z]{4,}\b", question)
+        anchor = " ".join(words[:3]) if words else question
+        fallback_candidates = [
+            question,
+            f"{anchor} symptoms diagnosis",
+            f"{anchor} differential diagnosis",
+            f"{anchor} diagnostic criteria",
+            f"{anchor} treatment",
+            f"{anchor} pathophysiology",
+            f"{anchor} risk factors",
+        ]
+
+        for candidate in fallback_candidates:
+            candidate_text = re.sub(r"\s+", " ", candidate).strip()
+            if not candidate_text:
+                continue
+            key = candidate_text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(candidate_text)
+            if len(cleaned) >= target_count:
+                return cleaned[:target_count]
+
+        # Absolute fallback: synthesize variants until target is met.
+        base = cleaned[0] if cleaned else question
+        suffixes = ["overview", "clinical features", "workup", "management", "prognosis"]
+        idx = 0
+        while len(cleaned) < target_count:
+            candidate_text = f"{base} {suffixes[idx % len(suffixes)]}".strip()
+            key = candidate_text.lower()
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(candidate_text)
+            idx += 1
+
+        return cleaned[:target_count]
     
     # =========================================================================
     # Planning V2: Improved diagnostic reasoning approach
@@ -1280,15 +1254,10 @@ class AsyncRAGEvaluator:
         """Generate answer using Chain-of-Thought (no RAG) asynchronously"""
         
         options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
-        
-        # CoT prompt format from MIRAGE template
-        user_prompt = f"""Here is the question:
-{question}
-
-Here are the potential choices:
-{options_text}
-
-Please think step-by-step and generate your output in json:"""
+        user_prompt = COT_USER_PROMPT_TEMPLATE.format(
+            question=question,
+            options=options_text,
+        )
         
         messages = [
             {"role": "system", "content": COT_SYSTEM_PROMPT},
@@ -1316,17 +1285,11 @@ Please think step-by-step and generate your output in json:"""
         
         context = "\n\n".join(context_parts) if context_parts else "No documents."
         options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
-        
-        user_prompt = f"""Here are the relevant documents:
-{context}
-
-Here is the question:
-{question}
-
-Here are the potential choices:
-{options_text}
-
-Please think step-by-step and generate your output in json:"""
+        user_prompt = MEDRAG_USER_PROMPT_TEMPLATE.format(
+            context=context,
+            question=question,
+            options=options_text,
+        )
         
         messages = [
             {"role": "system", "content": MIRAGE_SYSTEM_PROMPT},
@@ -1456,11 +1419,26 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
         session: aiohttp.ClientSession,
         modes: List[str] = None,
     ) -> Dict[str, Any]:
-        """Evaluate a single question across selected modes with maximum parallelism"""
-        
+        """
+        Evaluate one question for baseline modes only:
+        cot/directrag/directrewriting.
+
+        `planning*` variants are intentionally excluded from evaluate.py baseline
+        path to keep behavior aligned with evaluate_past usage.
+        """
+
         if modes is None:
-            modes = ["direct", "baseline", "planning"]
-        
+            modes = ["cot", "directrag", "directrewriting"]
+        modes = normalize_mode_list(modes)
+
+        allowed_modes = {"cot", "directrag", "directrewriting"}
+        invalid_modes = [mode for mode in modes if mode not in allowed_modes]
+        if invalid_modes:
+            raise ValueError(
+                f"Unsupported baseline mode(s): {invalid_modes}. "
+                f"Allowed: {sorted(allowed_modes)}"
+            )
+
         question = question_data['question']
         options = question_data['options']
         correct_answer = question_data.get('answer_idx', question_data.get('answer', ''))
@@ -1486,258 +1464,79 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                     "predicted_answer": cot_pred,
                     "is_correct": cot_pred.upper() == correct_answer.upper(),
                 }
-            
-            # Handle RAG modes (including planning_v2, planning_v3, planning_v4, planning_v5, planning_v6)
-            rag_modes = [m for m in modes if m in ["direct", "baseline", "planning", "planning_v2", "planning_v3", "planning_v4", "planning_v4_grpo", "planning_v5", "planning_v6"]]
-            
+
+            rag_modes = [mode for mode in modes if mode in ["directrag", "directrewriting"]]
             if rag_modes:
-                # Step 1: Generate plans and baseline queries in parallel
-                tasks = []
-                task_names = []
-                
-                need_plan = "planning" in rag_modes
-                need_plan_v2 = "planning_v2" in rag_modes
-                need_plan_v3 = "planning_v3" in rag_modes
-                need_plan_v4 = "planning_v4" in rag_modes
-                need_plan_v4_grpo = "planning_v4_grpo" in rag_modes
-                need_plan_v5 = "planning_v5" in rag_modes
-                need_plan_v6 = "planning_v6" in rag_modes
-                need_baseline_queries = "baseline" in rag_modes
-                
-                if need_plan:
-                    tasks.append(self.generate_plan_async(question, session))
-                    task_names.append("plan")
-                if need_plan_v2:
-                    tasks.append(self.generate_plan_v2_async(question, options, session))
-                    task_names.append("plan_v2")
-                if need_plan_v3:
-                    tasks.append(self.generate_plan_v3_async(question, options, session))
-                    task_names.append("plan_v3")
-                if need_plan_v4:
-                    tasks.append(self.generate_plan_v4_async(question, options, session))
-                    task_names.append("plan_v4")
-                if need_plan_v4_grpo:
-                    tasks.append(self.generate_plan_v4_async(question, options, session))
-                    task_names.append("plan_v4_grpo")
-                if need_plan_v5:
-                    # V5 uses same plan as V4
-                    tasks.append(self.generate_plan_v4_async(question, options, session))
-                    task_names.append("plan_v5")
-                if need_plan_v6:
-                    tasks.append(self.generate_plan_v6_async(question, options, session))
-                    task_names.append("plan_v6")
-                if need_baseline_queries:
-                    tasks.append(self.generate_subqueries_async(question, plan=None, session=session))
-                    task_names.append("baseline_queries")
-                
-                gathered = await asyncio.gather(*tasks) if tasks else []
-                
-                plan = None
-                plan_v2 = None
-                plan_v3 = None
-                plan_v4 = None
-                plan_v4_grpo = None
-                plan_v5 = None
-                plan_v6 = None
-                baseline_queries = None
-                for i, name in enumerate(task_names):
-                    if name == "plan":
-                        plan = gathered[i]
-                    elif name == "plan_v2":
-                        plan_v2 = gathered[i]
-                    elif name == "plan_v3":
-                        plan_v3 = gathered[i]
-                    elif name == "plan_v4":
-                        plan_v4 = gathered[i]
-                    elif name == "plan_v4_grpo":
-                        plan_v4_grpo = gathered[i]
-                    elif name == "plan_v5":
-                        plan_v5 = gathered[i]
-                    elif name == "plan_v6":
-                        plan_v6 = gathered[i]
-                    elif name == "baseline_queries":
-                        baseline_queries = gathered[i]
-                
-                # Step 2: Generate queries based on plans
-                planning_queries = None
-                planning_v2_queries = None
-                planning_v3_queries = None
-                planning_v4_queries = None
-                planning_v4_grpo_queries = None
-                planning_v5_queries = None
-                planning_v6_queries = None
-                
                 query_tasks = []
                 query_task_names = []
-                
-                if "planning" in rag_modes and plan:
-                    query_tasks.append(self.generate_subqueries_async(question, plan=plan, session=session))
-                    query_task_names.append("planning_queries")
-                if "planning_v2" in rag_modes and plan_v2:
-                    query_tasks.append(self.generate_queries_from_plan_v2_async(question, plan_v2, session))
-                    query_task_names.append("planning_v2_queries")
-                if "planning_v3" in rag_modes and plan_v3:
-                    query_tasks.append(self.generate_queries_from_plan_v3_async(question, plan_v3, session))
-                    query_task_names.append("planning_v3_queries")
-                if "planning_v4" in rag_modes and plan_v4:
-                    query_tasks.append(self.generate_queries_from_plan_v4_async(question, plan_v4, session))
-                    query_task_names.append("planning_v4_queries")
-                if "planning_v4_grpo" in rag_modes and plan_v4_grpo:
-                    # GRPO rewriter is sync (HF model), run in executor to avoid blocking
-                    loop = asyncio.get_event_loop()
-                    planning_v4_grpo_queries = await loop.run_in_executor(
-                        None, self.generate_queries_grpo_rewriter, question, options, plan_v4_grpo
+                if "directrewriting" in rag_modes:
+                    query_tasks.append(
+                        self.generate_subqueries_async(
+                            question,
+                            plan=None,
+                            session=session,
+                            system_prompt=DIRECT_REWRITING_SYSTEM_PROMPT,
+                            target_num_queries=DIRECT_REWRITING_TARGET_QUERIES,
+                        )
                     )
-                if "planning_v5" in rag_modes and plan_v5:
-                    # V5 uses same query generation as V4
-                    query_tasks.append(self.generate_queries_from_plan_v4_async(question, plan_v5, session))
-                    query_task_names.append("planning_v5_queries")
-                if "planning_v6" in rag_modes and plan_v6:
-                    query_tasks.append(self.generate_queries_from_plan_v6_async(question, plan_v6, session))
-                    query_task_names.append("planning_v6_queries")
-                
-                query_gathered = await asyncio.gather(*query_tasks) if query_tasks else []
+                    query_task_names.append("directrewriting_queries")
+
+                query_outputs = await asyncio.gather(*query_tasks) if query_tasks else []
+                directrewriting_queries: List[str] = []
                 for i, name in enumerate(query_task_names):
-                    if name == "planning_queries":
-                        planning_queries = query_gathered[i]
-                    elif name == "planning_v2_queries":
-                        planning_v2_queries = query_gathered[i]
-                    elif name == "planning_v3_queries":
-                        planning_v3_queries = query_gathered[i]
-                    elif name == "planning_v4_queries":
-                        planning_v4_queries = query_gathered[i]
-                    elif name == "planning_v4_grpo_queries":
-                        planning_v4_grpo_queries = query_gathered[i]
-                    elif name == "planning_v5_queries":
-                        planning_v5_queries = query_gathered[i]
-                    elif name == "planning_v6_queries":
-                        planning_v6_queries = query_gathered[i]
-                
-                # Step 3: Retrieve documents for each mode
-                direct_docs = []
-                baseline_docs = []
-                planning_docs = []
-                planning_v2_docs = []
-                planning_v3_docs = []
-                planning_v4_docs = []
-                planning_v4_grpo_docs = []
-                planning_v5_docs = []
-                planning_v6_docs = []
-                
-                # Each mode retrieves total_docs documents (budget split across queries)
-                T = self.total_docs
-                if "direct" in rag_modes:
-                    direct_docs = self.retrieve_documents([question], T)
-                if "baseline" in rag_modes and baseline_queries:
-                    k = max(1, T // len(baseline_queries))
-                    baseline_docs = self.retrieve_documents(baseline_queries, k)
-                if "planning" in rag_modes and planning_queries:
-                    k = max(1, T // len(planning_queries))
-                    planning_docs = self.retrieve_documents(planning_queries, k)
-                if "planning_v2" in rag_modes and planning_v2_queries:
-                    k = max(1, T // len(planning_v2_queries))
-                    planning_v2_docs = self.retrieve_documents(planning_v2_queries, k)
-                if "planning_v3" in rag_modes and planning_v3_queries:
-                    k = max(1, T // len(planning_v3_queries))
-                    planning_v3_docs = self.retrieve_documents(planning_v3_queries, k)
-                if "planning_v4" in rag_modes and planning_v4_queries:
-                    k = max(1, T // len(planning_v4_queries))
-                    planning_v4_docs = self.retrieve_documents(planning_v4_queries, k)
-                if "planning_v4_grpo" in rag_modes and planning_v4_grpo_queries:
-                    k = max(1, T // len(planning_v4_grpo_queries))
-                    planning_v4_grpo_docs = self.retrieve_documents(planning_v4_grpo_queries, k)
-                if "planning_v5" in rag_modes and planning_v5_queries:
-                    k = max(1, T // len(planning_v5_queries))
-                    planning_v5_docs = self.retrieve_documents(planning_v5_queries, k)
-                if "planning_v6" in rag_modes and planning_v6_queries:
-                    k = max(1, T // len(planning_v6_queries))
-                    planning_v6_docs = self.retrieve_documents(planning_v6_queries, k)
-                
-                # Step 4: Generate all answers in parallel
+                    if name == "directrewriting_queries":
+                        directrewriting_queries = query_outputs[i]
+
+                total_docs = self.total_docs
+                directrag_docs: List[Dict[str, Any]] = []
+                directrewriting_docs: List[Dict[str, Any]] = []
+                if "directrag" in rag_modes:
+                    directrag_docs = self.retrieve_documents(
+                        [question],
+                        total_docs,
+                        max_docs=total_docs,
+                    )
+                if "directrewriting" in rag_modes and directrewriting_queries:
+                    # Fixed setting: 3 subqueries × 5 docs per query = 15 docs.
+                    k = DIRECT_REWRITING_DOCS_PER_QUERY
+                    directrewriting_docs = self.retrieve_documents(
+                        directrewriting_queries,
+                        k,
+                        max_docs=DIRECT_REWRITING_TOTAL_DOCS,
+                    )
+
                 answer_tasks = []
                 answer_mode_order = []
-                
-                if "direct" in rag_modes:
-                    answer_tasks.append(self.generate_answer_async(question, options, direct_docs, session))
-                    answer_mode_order.append("direct")
-                if "baseline" in rag_modes and baseline_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, baseline_docs, session))
-                    answer_mode_order.append("baseline")
-                if "planning" in rag_modes and planning_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, planning_docs, session))
-                    answer_mode_order.append("planning")
-                if "planning_v2" in rag_modes and planning_v2_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, planning_v2_docs, session))
-                    answer_mode_order.append("planning_v2")
-                if "planning_v3" in rag_modes and planning_v3_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, planning_v3_docs, session))
-                    answer_mode_order.append("planning_v3")
-                if "planning_v4" in rag_modes and planning_v4_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, planning_v4_docs, session))
-                    answer_mode_order.append("planning_v4")
-                if "planning_v4_grpo" in rag_modes and planning_v4_grpo_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, planning_v4_grpo_docs, session))
-                    answer_mode_order.append("planning_v4_grpo")
-                if "planning_v5" in rag_modes and planning_v5_queries:
-                    # V5 uses the new method that includes plan and subqueries
-                    answer_tasks.append(self.generate_answer_with_plan_async(question, options, planning_v5_docs, plan_v5, planning_v5_queries, session))
-                    answer_mode_order.append("planning_v5")
-                if "planning_v6" in rag_modes and planning_v6_queries:
-                    answer_tasks.append(self.generate_answer_async(question, options, planning_v6_docs, session))
-                    answer_mode_order.append("planning_v6")
-                
+                if "directrag" in rag_modes:
+                    answer_tasks.append(
+                        self.generate_answer_async(question, options, directrag_docs, session)
+                    )
+                    answer_mode_order.append("directrag")
+                if "directrewriting" in rag_modes and directrewriting_queries:
+                    answer_tasks.append(
+                        self.generate_answer_async(question, options, directrewriting_docs, session)
+                    )
+                    answer_mode_order.append("directrewriting")
+
                 answer_results = await asyncio.gather(*answer_tasks) if answer_tasks else []
-                
-                # Build results
                 for i, mode in enumerate(answer_mode_order):
-                    raw_resp, predicted = answer_results[i]
-                    
-                    if mode == "direct":
-                        docs = direct_docs
+                    raw_response, predicted_answer = answer_results[i]
+                    if mode == "directrag":
+                        docs = directrag_docs
                         queries = [question]
-                        mode_plan = None
-                    elif mode == "baseline":
-                        docs = baseline_docs
-                        queries = baseline_queries if baseline_queries else []
-                        mode_plan = None
-                    elif mode == "planning":
-                        docs = planning_docs
-                        queries = planning_queries if planning_queries else []
-                        mode_plan = plan
-                    elif mode == "planning_v2":
-                        docs = planning_v2_docs
-                        queries = planning_v2_queries if planning_v2_queries else []
-                        mode_plan = plan_v2
-                    elif mode == "planning_v3":
-                        docs = planning_v3_docs
-                        queries = planning_v3_queries if planning_v3_queries else []
-                        mode_plan = plan_v3
-                    elif mode == "planning_v4":
-                        docs = planning_v4_docs
-                        queries = planning_v4_queries if planning_v4_queries else []
-                        mode_plan = plan_v4
-                    elif mode == "planning_v5":
-                        docs = planning_v5_docs
-                        queries = planning_v5_queries if planning_v5_queries else []
-                        mode_plan = plan_v5
-                    elif mode == "planning_v4_grpo":
-                        docs = planning_v4_grpo_docs
-                        queries = planning_v4_grpo_queries if planning_v4_grpo_queries else []
-                        mode_plan = plan_v4_grpo
-                    elif mode == "planning_v6":
-                        docs = planning_v6_docs
-                        queries = planning_v6_queries if planning_v6_queries else []
-                        mode_plan = plan_v6
-                    
+                    else:
+                        docs = directrewriting_docs
+                        queries = directrewriting_queries
+
                     result["modes"][mode] = {
                         "num_queries": len(queries),
                         "num_docs": len(docs),
                         "queries": queries,
-                        "plan": mode_plan,
-                        "retrieved_docs": docs,  # Full documents with title, content, scores
-                        "raw_response": raw_resp,
-                        "predicted_answer": predicted,
-                        "is_correct": predicted.upper() == correct_answer.upper(),
+                        "plan": None,
+                        "retrieved_docs": docs,
+                        "raw_response": raw_response,
+                        "predicted_answer": predicted_answer,
+                        "is_correct": predicted_answer.upper() == correct_answer.upper(),
                     }
             
         except Exception as e:
@@ -1754,10 +1553,10 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
         question_id: int,
         session: aiohttp.ClientSession,
     ) -> Dict[str, Any]:
-        """Evaluate a single question across all 3 RAG modes with maximum parallelism"""
+        """Evaluate a single question across cot/directrag/directrewriting."""
         return await self.evaluate_question_selected_modes(
             question_data, question_id, session,
-            modes=["direct", "baseline", "planning"]
+            modes=["cot", "directrag", "directrewriting"]
         )
 
 
@@ -1768,7 +1567,7 @@ async def run_evaluation_async(
     retriever_name: str = "MedCPT",
     corpus_name: str = "Textbooks",
     max_concurrent: int = 100,
-    output_dir: str = "results",
+    output_dir: Optional[str] = None,
     modes: List[str] = None,
     vllm_tensor_parallel_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.9,
@@ -1781,9 +1580,31 @@ async def run_evaluation_async(
     api_base: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
+    openai_api_key = None
+    if llm_provider == "openai":
+        openai_api_key = resolve_openai_api_key()
+        if not openai_api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY not found. Set env var or export it in ~/.bashrc."
+            )
+
+    output_dir = resolve_results_output_dir(
+        output_dir=output_dir,
+        llm_provider=llm_provider,
+        model_name=model_name,
+    )
     
     if modes is None:
-        modes = ["direct", "baseline", "planning"]
+        modes = ["cot", "directrag", "directrewriting"]
+    modes = normalize_mode_list(modes)
+
+    allowed_modes = {"cot", "directrag", "directrewriting"}
+    invalid_modes = [mode for mode in modes if mode not in allowed_modes]
+    if invalid_modes:
+        raise ValueError(
+            f"Unsupported baseline mode(s): {invalid_modes}. "
+            f"Allowed: {sorted(allowed_modes)}"
+        )
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -1804,7 +1625,15 @@ async def run_evaluation_async(
     
     rag_modes = [m for m in modes if m != "cot"]
     if rag_modes:
-        print(f"RAG: total_docs=15 per mode (budget split across queries)")
+        if "directrag" in rag_modes:
+            print(f"directrag: total_docs={total_docs}")
+        if "directrewriting" in rag_modes:
+            print(
+                "directrewriting: "
+                f"{DIRECT_REWRITING_TARGET_QUERIES} queries x "
+                f"{DIRECT_REWRITING_DOCS_PER_QUERY} docs = "
+                f"{DIRECT_REWRITING_TOTAL_DOCS}"
+            )
         print(f"Retriever: {retriever_name} | Corpus: {corpus_name}")
     
     print("=" * 80)
@@ -1819,6 +1648,7 @@ async def run_evaluation_async(
         model_name=model_name,
         retriever_name=retriever_name,
         corpus_name=corpus_name,
+        api_key=openai_api_key,
         max_concurrent=max_concurrent,
         total_docs=total_docs,
         rewriter_adapter_path=rewriter_adapter_path,
@@ -1854,14 +1684,10 @@ async def run_evaluation_async(
         
         # Estimate time based on mode complexity
         api_calls_per_question = len([m for m in modes if m == "cot"])  # 1 for CoT
-        if "direct" in modes:
+        if "directrag" in modes:
             api_calls_per_question += 1
-        if "baseline" in modes:
+        if "directrewriting" in modes:
             api_calls_per_question += 2  # subquery gen + answer
-        if "planning" in modes:
-            api_calls_per_question += 3  # plan + subquery gen + answer
-        
-        est_minutes = total_questions * api_calls_per_question / (max_concurrent * 3)  # rough estimate
         
         # Run all tasks with progress bar
         print(f"\nProcessing {total_questions} questions with {max_concurrent} concurrent requests...")
@@ -2071,9 +1897,66 @@ def _extract_vllm_output_texts(outputs) -> List[str]:
     return texts
 
 
+def _resolve_vllm_model_and_lora(model_path: str):
+    """
+    Resolve a checkpoint path for vLLM.
+
+    Returns:
+      model_for_vllm: base model path/name to load into LLM(...)
+      lora_request:   LoRARequest or None
+      load_msg:       human-readable message for logging
+      extra_llm_kwargs: kwargs to pass into LLM(...)
+    """
+    # Default: treat as a normal HF model or full checkpoint.
+    model_for_vllm = model_path
+    lora_request = None
+    load_msg = f"Loading model: {os.path.basename(model_path)}"
+    extra_llm_kwargs = {}
+
+    # LoRA adapter checkpoints typically contain adapter_config.json but no config.json.
+    if os.path.isdir(model_path):
+        adapter_cfg = os.path.join(model_path, "adapter_config.json")
+        has_hf_cfg = os.path.exists(os.path.join(model_path, "config.json"))
+        has_mistral_cfg = os.path.exists(os.path.join(model_path, "params.json"))
+
+        if os.path.exists(adapter_cfg) and not (has_hf_cfg or has_mistral_cfg):
+            try:
+                from vllm.lora.request import LoRARequest
+
+                with open(adapter_cfg, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                base_model = cfg.get("base_model_name_or_path")
+                lora_rank = int(cfg.get("r", 16) or 16)
+                if not base_model:
+                    raise ValueError(
+                        f"adapter_config.json missing base_model_name_or_path: {adapter_cfg}"
+                    )
+
+                # vLLM loads base model once, then applies LoRA per request.
+                model_for_vllm = base_model
+                lora_request = LoRARequest(
+                    lora_name=os.path.basename(os.path.normpath(model_path)),
+                    lora_int_id=1,
+                    lora_path=model_path,
+                )
+                extra_llm_kwargs["enable_lora"] = True
+                extra_llm_kwargs["max_lora_rank"] = max(8, lora_rank)
+                load_msg = (
+                    f"Loading base model: {base_model} + LoRA: "
+                    f"{os.path.basename(model_path)} (r={lora_rank})"
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to configure LoRA checkpoint '{model_path}': {e}"
+                ) from e
+
+    return model_for_vllm, lora_request, load_msg, extra_llm_kwargs
+
+
 def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
                           output_file: str, gpu_mem: float,
-                          max_model_len: int, max_tokens: int):
+                          max_model_len: int, max_tokens: int,
+                          tensor_parallel_size: int = 1):
     """
     Subprocess entry: load vLLM model, run batch chat, save outputs, exit.
     All GPU memory is freed when this process exits.
@@ -2084,13 +1967,16 @@ def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
     with open(messages_list_file, "rb") as f:
         messages_list = pickle.load(f)
 
-    print(f"    [subprocess] Loading model: {os.path.basename(model_path)} ...")
+    model_for_vllm, lora_request, load_msg, extra_llm_kwargs = _resolve_vllm_model_and_lora(model_path)
+    print(f"    [subprocess] {load_msg} ...")
     llm = LLM(
-        model=model_path,
+        model=model_for_vllm,
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_model_len,
+        tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
         enforce_eager=True,
+        **extra_llm_kwargs,
     )
 
     sampling = SamplingParams(temperature=0, max_tokens=max_tokens)
@@ -2098,9 +1984,18 @@ def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
 
     prompts = [_format_chat_messages(llm.get_tokenizer(), m) for m in messages_list]
     try:
-        outputs = llm.chat(messages=messages_list, sampling_params=sampling)
+        outputs = llm.chat(
+            messages=messages_list,
+            sampling_params=sampling,
+            lora_request=lora_request,
+        )
     except Exception:
-        outputs = llm.generate(prompts, sampling_params=sampling, use_tqdm=False)
+        outputs = llm.generate(
+            prompts,
+            sampling_params=sampling,
+            lora_request=lora_request,
+            use_tqdm=False,
+        )
 
     # Extract text outputs
     result_texts = _extract_vllm_output_texts(outputs)
@@ -2120,7 +2015,8 @@ def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
 
 def _run_phase_in_subprocess(model_path: str, messages_list: list,
                              gpu_mem: float, max_model_len: int,
-                             max_tokens: int) -> list:
+                             max_tokens: int,
+                             tensor_parallel_size: int = 1) -> list:
     """Run a vLLM batch in a subprocess and return result texts."""
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f_in:
         pickle.dump(messages_list, f_in)
@@ -2132,7 +2028,7 @@ def _run_phase_in_subprocess(model_path: str, messages_list: list,
         p = _mp.Process(
             target=_run_vllm_batch_phase,
             args=(model_path, input_path, output_path,
-                  gpu_mem, max_model_len, max_tokens),
+                  gpu_mem, max_model_len, max_tokens, tensor_parallel_size),
         )
         p.start()
         p.join()
@@ -2150,6 +2046,434 @@ def _run_phase_in_subprocess(model_path: str, messages_list: list,
                 pass
 
 
+def _format_list(val):
+    """Convert list or string to comma-separated string."""
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val[:5])
+    return str(val)
+
+
+async def _run_openai_batch_phase(
+    client: AsyncOpenAIClient,
+    session: aiohttp.ClientSession,
+    messages_list: List[List[Dict[str, str]]],
+    desc: str,
+) -> List[str]:
+    """Run one phase using OpenAI async client, preserving input order."""
+    if not messages_list:
+        return []
+    tasks = [
+        client.chat_completion(messages=messages, session=session)
+        for messages in messages_list
+    ]
+    return await tqdm_asyncio.gather(*tasks, desc=desc)
+
+
+async def run_batch_phased_evaluation_openai(
+    base_model: str,
+    rewriter_checkpoint: str = None,
+    hypothesis_checkpoint: str = None,
+    generator_checkpoint: str = None,
+    max_questions: int = 1273,
+    total_docs: int = 15,
+    max_tokens: int = 2048,
+    max_concurrent: int = 100,
+    output_dir: Optional[str] = None,
+    retriever_name: str = "MedCPT",
+    corpus_name: str = "Textbooks",
+    hypothesis_prompt: str = "v1",
+    rewriting_prompt: str = "v1",
+    generator_prompt: str = "v1",
+    api_base: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Batch-phased hypothesis evaluation via OpenAI API (GPT-compatible).
+
+    This mirrors run_batch_phased_evaluation() but uses async API calls
+    instead of vLLM subprocess inference.
+    """
+    from training.reward import (
+        parse_queries_from_completion, parse_hypothesis_plan,
+    )
+
+    output_dir = resolve_results_output_dir(
+        output_dir=output_dir,
+        llm_provider="openai",
+        model_name=base_model,
+    )
+
+    api_key = resolve_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found. Set env or add export to ~/.bashrc.")
+
+    # Resolve per-module models
+    hypothesis_model = hypothesis_checkpoint or base_model
+    rewriter_model = rewriter_checkpoint or base_model
+    generator_model = generator_checkpoint or base_model
+
+    h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt]
+    r_prompt = REWRITING_PROMPTS[rewriting_prompt]
+    g_prompt = GENERATOR_PROMPTS[generator_prompt]
+    combo_tag = f"h{hypothesis_prompt}_r{rewriting_prompt}_g{generator_prompt}"
+
+    hypothesis_client = AsyncOpenAIClient(
+        api_key=api_key,
+        model=hypothesis_model,
+        max_concurrent=max_concurrent,
+        api_base=api_base,
+    )
+    rewriter_client = AsyncOpenAIClient(
+        api_key=api_key,
+        model=rewriter_model,
+        max_concurrent=max_concurrent,
+        api_base=api_base,
+    )
+    generator_client = AsyncOpenAIClient(
+        api_key=api_key,
+        model=generator_model,
+        max_concurrent=max_concurrent,
+        api_base=api_base,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load dataset
+    dataset = MedQADataset()
+    n = min(max_questions, len(dataset))
+    questions = [dataset[i] for i in range(n)]
+    print(f"\n{'='*70}")
+    print(f"Batch-Phased Evaluation (OpenAI): {n} questions")
+    print(f"Combo:        {combo_tag}")
+    print(f"  hypothesis: {h_prompt['description']}")
+    print(f"  rewriting:  {r_prompt['description']}")
+    print(f"  generator:  {g_prompt['description']}")
+    print(f"Base model:   {base_model}")
+    print(f"Hypothesis:   {hypothesis_model}"
+          f"{' (checkpoint override)' if hypothesis_checkpoint else ''}")
+    print(f"Rewriter:     {rewriter_model}"
+          f"{' (checkpoint override)' if rewriter_checkpoint else ''}")
+    print(f"Generator:    {generator_model}"
+          f"{' (checkpoint override)' if generator_checkpoint else ''}")
+    print(f"max_concurrent={max_concurrent}  max_tokens={max_tokens}")
+    if api_base:
+        print(f"api_base={api_base}")
+    print(f"{'='*70}")
+
+    t_total = time.time()
+
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrent,
+        limit_per_host=max_concurrent,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # ── Phase 1: Hypothesis ALL (OpenAI async) ──
+        print(f"\n[Phase 1/4] Generating hypotheses for {n} questions "
+              f"({hypothesis_model}) ...")
+        t1 = time.time()
+
+        plan_messages = []
+        for qd in questions:
+            options_text = "\n".join(
+                [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+            )
+            user = h_prompt["user"].format(
+                question=qd["question"],
+                options=options_text,
+            )
+            plan_messages.append([
+                {"role": "system", "content": h_prompt["system"]},
+                {"role": "user", "content": user},
+            ])
+
+        plan_texts = await _run_openai_batch_phase(
+            hypothesis_client,
+            session,
+            plan_messages,
+            desc="Phase1-Hypothesis",
+        )
+
+        plans = []
+        for idx, text in enumerate(plan_texts):
+            p = parse_hypothesis_plan(text)
+            p.setdefault("discriminating_features", [])
+            p.setdefault("best_guess", "")
+            p.setdefault("best_guess_text", "")
+            p.setdefault("reasoning", "")
+            p.setdefault("confirming_evidence", [])
+            p.setdefault("alternative_if_wrong", "")
+            if not p["discriminating_features"]:
+                words = re.findall(r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
+                p["discriminating_features"] = words[:3] or ["symptom"]
+            plans.append(p)
+
+        print(f"  ✓ Phase 1 done: {len(plans)} hypotheses "
+              f"in {time.time()-t1:.1f}s")
+
+        # ── Phase 2: Rewrite ALL (OpenAI async) ──
+        print(f"\n[Phase 2/4] Generating queries for {n} questions "
+              f"({rewriter_model}) ...")
+        t2 = time.time()
+
+        rw_messages = []
+        for i, qd in enumerate(questions):
+            p = plans[i]
+            options_text = "\n".join(
+                [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+            )
+            bg_letter = (p.get("best_guess", "") or "").strip().upper().rstrip(".")
+            bg_text = p.get("best_guess_text") or (
+                f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}"
+                if bg_letter in qd.get("options", {}) else bg_letter
+            )
+            alt_letter = (p.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
+            alt_text = (
+                f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}"
+                if alt_letter in qd.get("options", {}) else alt_letter
+            )
+            user = r_prompt["user"].format(
+                question=qd["question"],
+                options=options_text,
+                best_guess=p.get("best_guess", ""),
+                best_guess_text=bg_text,
+                reasoning=p.get("reasoning", ""),
+                confirming_evidence=_format_list(p.get("confirming_evidence", [])),
+                discriminating_features=_format_list(p.get("discriminating_features", [])),
+                alternative_if_wrong=p.get("alternative_if_wrong", ""),
+                alternative_text=alt_text,
+            )
+            rw_messages.append([
+                {"role": "system", "content": r_prompt["system"]},
+                {"role": "user", "content": user},
+            ])
+
+        rw_texts = await _run_openai_batch_phase(
+            rewriter_client,
+            session,
+            rw_messages,
+            desc="Phase2-Rewriter",
+        )
+
+        all_queries = []
+        for i, text in enumerate(rw_texts):
+            queries = parse_queries_from_completion(text)
+            if len(queries) < 2:
+                p = plans[i]
+                bg = p.get("best_guess", "")
+                cf = _format_list(p.get("confirming_evidence", []))
+                df = _format_list(p.get("discriminating_features", []))
+                queries = [f"{bg} {df}", cf, f"{p.get('reasoning', '')} diagnosis"]
+            all_queries.append(queries[:5])
+
+        print(f"  ✓ Phase 2 done: {len(all_queries)} query sets "
+              f"in {time.time()-t2:.1f}s")
+
+        # ── Phase 3: Retrieve ALL (CPU, in-process) ──
+        print(f"\n[Phase 3/4] Retrieving documents for {n} questions ...")
+        t3 = time.time()
+
+        try:
+            from retrieval.retriever import create_retriever as _cr
+            retriever = _cr(
+                retriever_type="mirage",
+                retriever_name=retriever_name,
+                corpus_name=corpus_name,
+            )
+            if hasattr(retriever, "_lazy_init"):
+                retriever._lazy_init()
+        except Exception as e:
+            print(f"  WARNING: Retriever init failed: {e}")
+            retriever = None
+
+        all_docs = []
+        for i, queries in enumerate(all_queries):
+            doc_scores: Dict[str, float] = {}
+            doc_data: Dict[str, Dict[str, Any]] = {}
+            if retriever:
+                k_per = max(1, total_docs // max(len(queries), 1))
+                for q in queries:
+                    try:
+                        docs, scores = retriever.retrieve(q, k=k_per)
+                        for doc, score in zip(docs, scores):
+                            doc_id = doc.get(
+                                "id",
+                                doc.get("title", str(hash(doc.get("content", "")[:100]))),
+                            )
+                            if doc_id not in doc_scores:
+                                doc_scores[doc_id] = 0.0
+                                doc_data[doc_id] = doc.copy()
+                                doc_data[doc_id]["query_trace"] = []
+                            try:
+                                doc_scores[doc_id] += float(score)
+                            except Exception:
+                                doc_scores[doc_id] += 0.0
+                            doc_data[doc_id]["query_trace"].append(q)
+                    except Exception:
+                        pass
+
+            docs_sorted = []
+            for doc_id in sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True):
+                doc = doc_data[doc_id]
+                doc["fused_score"] = doc_scores[doc_id]
+                docs_sorted.append(doc)
+
+            all_docs.append(docs_sorted)
+            if (i + 1) % 200 == 0:
+                print(f"  ... {i+1}/{n} retrieved")
+
+        print(f"  ✓ Phase 3 done: retrieval in {time.time()-t3:.1f}s")
+
+        # Free retriever memory before phase 4
+        if retriever is not None:
+            del retriever
+        import gc
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("  ✓ Retriever memory freed")
+
+        # ── Phase 4: Answer ALL (OpenAI async) ──
+        print(f"\n[Phase 4/4] Generating answers for {n} questions "
+              f"({generator_model}) ...")
+        t4 = time.time()
+
+        ans_messages = []
+        for i, qd in enumerate(questions):
+            options_text = "\n".join(
+                [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+            )
+            docs = all_docs[i]
+            ctx = "\n\n".join(
+                [
+                    f"Document [{j+1}] (Title: {d.get('title', 'Untitled')})\n"
+                    f"{d.get('content', '')}"
+                    for j, d in enumerate(docs[:25])
+                ]
+            ) or "No documents."
+
+            fmt_vars = {
+                "context": ctx,
+                "question": qd["question"],
+                "options": options_text,
+            }
+            if generator_prompt == "v2":
+                p = plans[i]
+                fmt_vars["hypothesis_summary"] = (
+                    f"Best guess: {p.get('best_guess', '')} — {p.get('reasoning', '')}"
+                )
+                fmt_vars["queries_summary"] = "\n".join(
+                    f"  {j+1}. {q}" for j, q in enumerate(all_queries[i])
+                )
+
+            user = g_prompt["user"].format(**fmt_vars)
+            ans_messages.append([
+                {"role": "system", "content": g_prompt["system"]},
+                {"role": "user", "content": user},
+            ])
+
+        ans_texts = await _run_openai_batch_phase(
+            generator_client,
+            session,
+            ans_messages,
+            desc="Phase4-Generator",
+        )
+
+        print(f"  ✓ Phase 4 done: answers in {time.time()-t4:.1f}s")
+
+    # ── Compile Results ──
+    print(f"\n[Result] Compiling ...")
+    results = []
+    correct = 0
+    total = 0
+    for i, qd in enumerate(questions):
+        correct_answer = qd.get("answer_idx", qd.get("answer", ""))
+        raw_resp = ans_texts[i]
+        predicted = parse_answer(raw_resp)
+        is_correct = predicted.upper() == correct_answer.upper()
+        if is_correct:
+            correct += 1
+        total += 1
+        results.append({
+            "question_id": i,
+            "question": qd["question"],
+            "options": qd["options"],
+            "correct_answer": correct_answer,
+            "modes": {
+                combo_tag: {
+                    "num_queries": len(all_queries[i]),
+                    "num_docs": len(all_docs[i]),
+                    "queries": all_queries[i],
+                    "plan": plans[i],
+                    "raw_response": raw_resp,
+                    "predicted_answer": predicted,
+                    "is_correct": is_correct,
+                }
+            },
+        })
+
+    elapsed = time.time() - t_total
+    accuracy = correct / total * 100 if total > 0 else 0
+
+    summary = {
+        "config": {
+            "llm_provider": "openai",
+            "base_model": base_model,
+            "hypothesis_checkpoint": hypothesis_checkpoint,
+            "rewriter_checkpoint": rewriter_checkpoint,
+            "generator_checkpoint": generator_checkpoint,
+            "hypothesis_prompt": hypothesis_prompt,
+            "rewriting_prompt": rewriting_prompt,
+            "generator_prompt": generator_prompt,
+            "combo_tag": combo_tag,
+            "total_evaluated": total,
+            "total_docs": total_docs,
+            "max_tokens": max_tokens,
+            "max_concurrent": max_concurrent,
+            "api_base": api_base,
+        },
+        "timing": {
+            "total_seconds": elapsed,
+            "avg_per_question": elapsed / total if total else 0,
+            "questions_per_minute": total / elapsed * 60 if elapsed > 0 else 0,
+        },
+        "mode_results": {
+            combo_tag: {
+                "correct": correct,
+                "total": total,
+                "accuracy": accuracy,
+            }
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    print(f"\n{'='*70}")
+    print(f"[{combo_tag}] {accuracy:.2f}% ({correct}/{total}) "
+          f"in {elapsed:.0f}s ({summary['timing']['questions_per_minute']:.1f} q/min)")
+    print(f"{'='*70}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", base_model).strip("_")
+    if not model_suffix:
+        model_suffix = "model"
+    out_file = os.path.join(
+        output_dir,
+        f"medqa_{combo_tag}_{model_suffix}_{ts}.json",
+    )
+    with open(out_file, "w") as f:
+        json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
+    print(f"✓ Saved: {out_file}")
+
+    return {
+        "combo": combo_tag,
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "file": out_file,
+    }
+
+
 def run_batch_phased_evaluation(
     base_model: str,
     rewriter_checkpoint: str = None,
@@ -2160,27 +2484,42 @@ def run_batch_phased_evaluation(
     gpu_mem: float = 0.9,
     max_model_len: int = 8192,
     max_tokens: int = 2048,
-    output_dir: str = "results",
+    output_dir: Optional[str] = None,
     retriever_name: str = "MedCPT",
     corpus_name: str = "Textbooks",
+    vllm_tensor_parallel_size: int = 1,
+    hypothesis_prompt: str = "v1",
+    rewriting_prompt: str = "v1",
+    generator_prompt: str = "v1",
 ) -> Dict[str, Any]:
     """
-    Batch-phased evaluation: process ALL questions per phase.
+    Batch-phased evaluation with selectable prompts.
     Each vLLM phase runs in a separate subprocess → full GPU memory release.
 
-    Each module can use a custom checkpoint (defaults to base_model):
-      - hypothesis_checkpoint: Phase 1 model + format_hypothesis_prompt
-      - rewriter_checkpoint:   Phase 2 model
-      - generator_checkpoint:  Phase 4 model
+    Args:
+        hypothesis_prompt: "v1", "v2", or "v3" (from core/prompts.py)
+        rewriting_prompt:  "v1", "v2", or "v3" (from core/prompts.py)
+        generator_prompt:  "v1" or "v2"        (from core/prompts.py)
     """
-    from data.medqa_loader import format_rewriter_prompt
-    from training.reward import parse_queries_from_completion
+    output_dir = resolve_results_output_dir(
+        output_dir=output_dir,
+        llm_provider="vllm",
+        model_name=base_model,
+    )
+
+    from training.reward import (
+        parse_queries_from_completion, parse_hypothesis_plan,
+    )
 
     # Resolve per-module models
     hypothesis_model = hypothesis_checkpoint or base_model
     rewriter_model = rewriter_checkpoint or base_model
     generator_model = generator_checkpoint or base_model
-    use_hypothesis_prompt = hypothesis_checkpoint is not None
+
+    h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt]
+    r_prompt = REWRITING_PROMPTS[rewriting_prompt]
+    g_prompt = GENERATOR_PROMPTS[generator_prompt]
+    combo_tag = f"h{hypothesis_prompt}_r{rewriting_prompt}_g{generator_prompt}"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2190,78 +2529,60 @@ def run_batch_phased_evaluation(
     questions = [dataset[i] for i in range(n)]
     print(f"\n{'='*70}")
     print(f"Batch-Phased Evaluation: {n} questions")
+    print(f"Combo:        {combo_tag}")
+    print(f"  hypothesis: {h_prompt['description']}")
+    print(f"  rewriting:  {r_prompt['description']}")
+    print(f"  generator:  {g_prompt['description']}")
     print(f"Base model:   {base_model}")
-    print(f"Hypothesis:   {hypothesis_model}{' (checkpoint)' if hypothesis_checkpoint else ''}")
-    print(f"Rewriter:     {rewriter_model}{' (checkpoint)' if rewriter_checkpoint else ''}")
-    print(f"Generator:    {generator_model}{' (checkpoint)' if generator_checkpoint else ''}")
-    print(f"gpu_mem={gpu_mem}  max_model_len={max_model_len}  max_tokens={max_tokens}")
+    print(f"Hypothesis:   {hypothesis_model}"
+          f"{' (checkpoint)' if hypothesis_checkpoint else ''}")
+    print(f"Rewriter:     {rewriter_model}"
+          f"{' (checkpoint)' if rewriter_checkpoint else ''}")
+    print(f"Generator:    {generator_model}"
+          f"{' (checkpoint)' if generator_checkpoint else ''}")
+    print(f"vllm_tp={vllm_tensor_parallel_size}  "
+          f"gpu_mem={gpu_mem}  max_model_len={max_model_len}  "
+          f"max_tokens={max_tokens}")
     print(f"{'='*70}")
 
     t_total = time.time()
 
-    # ── Phase 1: Plan/Hypothesis ALL (subprocess) ──
-    phase1_label = "hypotheses" if use_hypothesis_prompt else "plans"
-    print(f"\n[Phase 1/4] Generating {phase1_label} for {n} questions "
+    # ── Phase 1: Hypothesis ALL (subprocess) ──
+    print(f"\n[Phase 1/4] Generating hypotheses for {n} questions "
           f"({os.path.basename(hypothesis_model)}) ...")
     t1 = time.time()
 
     plan_messages = []
-    if use_hypothesis_prompt:
-        from data.medqa_loader import format_hypothesis_prompt
-        for qd in questions:
-            plan_messages.append(
-                format_hypothesis_prompt(qd["question"], qd["options"]))
-    else:
-        for qd in questions:
-            options_text = "\n".join(
-                [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
-            prompt = PLANNING_V4_PROMPT.format(
-                question=qd["question"], options=options_text)
-            plan_messages.append([
-                {"role": "system",
-                 "content": "You are an expert medical diagnostician. "
-                            "Make your best diagnostic guess and identify "
-                            "what evidence would confirm it."},
-                {"role": "user", "content": prompt},
-            ])
+    for qd in questions:
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        user = h_prompt["user"].format(
+            question=qd["question"], options=options_text)
+        plan_messages.append([
+            {"role": "system", "content": h_prompt["system"]},
+            {"role": "user", "content": user},
+        ])
 
     plan_texts = _run_phase_in_subprocess(
-        hypothesis_model, plan_messages, gpu_mem, max_model_len, max_tokens)
+        hypothesis_model, plan_messages, gpu_mem, max_model_len, max_tokens,
+        vllm_tensor_parallel_size)
 
     plans = []
-    if use_hypothesis_prompt:
-        from training.reward import parse_hypothesis_plan
-        for idx, text in enumerate(plan_texts):
-            p = parse_hypothesis_plan(text)
-            p.setdefault("discriminating_features", [])
-            p.setdefault("best_guess", "")
-            p.setdefault("reasoning", "")
-            p.setdefault("confirming_evidence", [])
-            p.setdefault("alternative_if_wrong", "")
-            if not p["discriminating_features"]:
-                words = re.findall(r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
-                p["discriminating_features"] = words[:3] or ["symptom"]
-            plans.append(p)
-    else:
-        for idx, text in enumerate(plan_texts):
-            try:
-                if '{' in text and '}' in text:
-                    p = json.loads(text[text.find('{'):text.rfind('}')+1])
-                else:
-                    p = {}
-            except Exception:
-                p = {}
-            p.setdefault("discriminating_features", [])
-            p.setdefault("best_guess", "")
-            p.setdefault("reasoning", "")
-            p.setdefault("confirming_evidence", [])
-            p.setdefault("alternative_if_wrong", "")
-            if not p["discriminating_features"]:
-                words = re.findall(r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
-                p["discriminating_features"] = words[:3] or ["symptom"]
-            plans.append(p)
+    for idx, text in enumerate(plan_texts):
+        p = parse_hypothesis_plan(text)
+        p.setdefault("discriminating_features", [])
+        p.setdefault("best_guess", "")
+        p.setdefault("reasoning", "")
+        p.setdefault("confirming_evidence", [])
+        p.setdefault("alternative_if_wrong", "")
+        if not p["discriminating_features"]:
+            words = re.findall(
+                r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
+            p["discriminating_features"] = words[:3] or ["symptom"]
+        plans.append(p)
 
-    print(f"  ✓ Phase 1 done: {len(plans)} {phase1_label} in {time.time()-t1:.1f}s")
+    print(f"  ✓ Phase 1 done: {len(plans)} hypotheses "
+          f"in {time.time()-t1:.1f}s")
 
     # ── Phase 2: Rewrite ALL (rewriter model, subprocess) ──
     print(f"\n[Phase 2/4] Generating queries for {n} questions "
@@ -2270,11 +2591,38 @@ def run_batch_phased_evaluation(
 
     rw_messages = []
     for i, qd in enumerate(questions):
-        msgs = format_rewriter_prompt(qd["question"], qd["options"], plans[i])
-        rw_messages.append(msgs)
+        p = plans[i]
+        options_text = "\n".join(
+            [f"{k}. {v}" for k, v in sorted(qd["options"].items())])
+        # Expand best_guess letter to include option text (e.g. "A" -> "A. Psoriasis")
+        bg_letter = (p.get("best_guess", "") or "").strip().upper().rstrip(".")
+        # Prefer model-generated best_guess_text (hv7+), fall back to code expansion
+        bg_text = p.get("best_guess_text") or (
+            f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}" if bg_letter in qd.get('options', {}) else bg_letter
+        )
+        alt_letter = (p.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
+        alt_text = f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}" if alt_letter in qd.get('options', {}) else alt_letter
+        user = r_prompt["user"].format(
+            question=qd["question"],
+            options=options_text,
+            best_guess=p.get("best_guess", ""),
+            best_guess_text=bg_text,
+            reasoning=p.get("reasoning", ""),
+            confirming_evidence=_format_list(
+                p.get("confirming_evidence", [])),
+            discriminating_features=_format_list(
+                p.get("discriminating_features", [])),
+            alternative_if_wrong=p.get("alternative_if_wrong", ""),
+            alternative_text=alt_text,
+        )
+        rw_messages.append([
+            {"role": "system", "content": r_prompt["system"]},
+            {"role": "user", "content": user},
+        ])
 
     rw_texts = _run_phase_in_subprocess(
-        rewriter_model, rw_messages, gpu_mem, max_model_len, max_tokens)
+        rewriter_model, rw_messages, gpu_mem, max_model_len, max_tokens,
+        vllm_tensor_parallel_size)
 
     all_queries = []
     for i, text in enumerate(rw_texts):
@@ -2282,22 +2630,22 @@ def run_batch_phased_evaluation(
         if len(queries) < 2:
             p = plans[i]
             bg = p.get("best_guess", "")
-            cf = ", ".join(p.get("confirming_evidence", [])[:3])
-            df = ", ".join(p.get("discriminating_features", [])[:3])
+            cf = _format_list(p.get("confirming_evidence", []))
+            df = _format_list(p.get("discriminating_features", []))
             queries = [f"{bg} {df}", cf,
                        f"{p.get('reasoning','')} diagnosis"]
         all_queries.append(queries[:5])
 
-    print(f"  ✓ Phase 2 done: {len(all_queries)} query sets in "
-          f"{time.time()-t2:.1f}s")
+    print(f"  ✓ Phase 2 done: {len(all_queries)} query sets "
+          f"in {time.time()-t2:.1f}s")
 
     # ── Phase 3: Retrieve ALL (CPU, in-process) ──
     print(f"\n[Phase 3/4] Retrieving documents for {n} questions ...")
     t3 = time.time()
 
     try:
-        from retriever import create_retriever
-        retriever = create_retriever(
+        from retrieval.retriever import create_retriever as _cr
+        retriever = _cr(
             retriever_type="mirage",
             retriever_name=retriever_name,
             corpus_name=corpus_name,
@@ -2320,8 +2668,8 @@ def run_batch_phased_evaluation(
                     for doc, score in zip(docs, scores):
                         doc_id = doc.get(
                             "id",
-                            doc.get("title", str(hash(doc.get("content", "")[:100])))
-                        )
+                            doc.get("title",
+                                    str(hash(doc.get("content", "")[:100]))))
                         if doc_id not in doc_scores:
                             doc_scores[doc_id] = 0.0
                             doc_data[doc_id] = doc.copy()
@@ -2335,7 +2683,9 @@ def run_batch_phased_evaluation(
                     pass
 
         docs_sorted = []
-        for doc_id in sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True):
+        for doc_id in sorted(
+                doc_scores.keys(),
+                key=lambda x: doc_scores[x], reverse=True):
             doc = doc_data[doc_id]
             doc["fused_score"] = doc_scores[doc_id]
             docs_sorted.append(doc)
@@ -2347,7 +2697,8 @@ def run_batch_phased_evaluation(
     print(f"  ✓ Phase 3 done: retrieval in {time.time()-t3:.1f}s")
 
     # Free retriever GPU memory before Phase 4 vLLM subprocess
-    del retriever
+    if retriever is not None:
+        del retriever
     import gc
     gc.collect()
     try:
@@ -2362,12 +2713,6 @@ def run_batch_phased_evaluation(
           f"({os.path.basename(generator_model)}) ...")
     t4 = time.time()
 
-    try:
-        from template import general_medrag_system
-        system_prompt = general_medrag_system
-    except ImportError:
-        system_prompt = "You are a helpful medical assistant."
-
     ans_messages = []
     for i, qd in enumerate(questions):
         options_text = "\n".join(
@@ -2378,18 +2723,31 @@ def run_batch_phased_evaluation(
              f"{d.get('content','')}"
              for j, d in enumerate(docs[:25])]
         ) or "No documents."
-        user_prompt = (
-            f"Here are the relevant documents:\n{ctx}\n\n"
-            f"Here is the question:\n{qd['question']}\n\n"
-            f"Here are the potential choices:\n{options_text}\n\n"
-            f"Please think step-by-step and generate your output in json:")
+
+        fmt_vars = {
+            "context": ctx,
+            "question": qd["question"],
+            "options": options_text,
+        }
+        # generator v2 needs extra context
+        if generator_prompt == "v2":
+            p = plans[i]
+            fmt_vars["hypothesis_summary"] = (
+                f"Best guess: {p.get('best_guess','')} — "
+                f"{p.get('reasoning','')}"
+            )
+            fmt_vars["queries_summary"] = "\n".join(
+                f"  {j+1}. {q}" for j, q in enumerate(all_queries[i]))
+
+        user = g_prompt["user"].format(**fmt_vars)
         ans_messages.append([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": g_prompt["system"]},
+            {"role": "user", "content": user},
         ])
 
     ans_texts = _run_phase_in_subprocess(
-        generator_model, ans_messages, gpu_mem, max_model_len, max_tokens)
+        generator_model, ans_messages, gpu_mem, max_model_len, max_tokens,
+        vllm_tensor_parallel_size)
 
     print(f"  ✓ Phase 4 done: answers in {time.time()-t4:.1f}s")
 
@@ -2412,7 +2770,7 @@ def run_batch_phased_evaluation(
             "options": qd["options"],
             "correct_answer": correct_answer,
             "modes": {
-                "planning_v4_grpo": {
+                combo_tag: {
                     "num_queries": len(all_queries[i]),
                     "num_docs": len(all_docs[i]),
                     "queries": all_queries[i],
@@ -2427,28 +2785,31 @@ def run_batch_phased_evaluation(
     elapsed = time.time() - t_total
     accuracy = correct / total * 100 if total > 0 else 0
 
-    # Determine mode label for results
-    mode_label = "planning_v4_grpo"
-
     summary = {
         "config": {
             "base_model": base_model,
             "hypothesis_checkpoint": hypothesis_checkpoint,
             "rewriter_checkpoint": rewriter_checkpoint,
             "generator_checkpoint": generator_checkpoint,
+            "hypothesis_prompt": hypothesis_prompt,
+            "rewriting_prompt": rewriting_prompt,
+            "generator_prompt": generator_prompt,
+            "combo_tag": combo_tag,
             "total_evaluated": total,
             "total_docs": total_docs,
             "gpu_mem": gpu_mem,
+            "vllm_tensor_parallel_size": vllm_tensor_parallel_size,
             "max_model_len": max_model_len,
             "max_tokens": max_tokens,
         },
         "timing": {
             "total_seconds": elapsed,
             "avg_per_question": elapsed / total if total else 0,
-            "questions_per_minute": total / elapsed * 60 if elapsed > 0 else 0,
+            "questions_per_minute":
+                total / elapsed * 60 if elapsed > 0 else 0,
         },
         "mode_results": {
-            mode_label: {
+            combo_tag: {
                 "correct": correct, "total": total, "accuracy": accuracy,
             }
         },
@@ -2456,128 +2817,315 @@ def run_batch_phased_evaluation(
     }
 
     print(f"\n{'='*70}")
-    print(f"RESULTS: {accuracy:.1f}% ({correct}/{total}) in {elapsed:.0f}s "
+    print(f"[{combo_tag}] {accuracy:.2f}% ({correct}/{total}) "
+          f"in {elapsed:.0f}s "
           f"({summary['timing']['questions_per_minute']:.1f} q/min)")
     print(f"{'='*70}")
 
-    # Save — name includes the primary checkpoint being evaluated
-    primary_ckpt = hypothesis_checkpoint or rewriter_checkpoint or base_model
-    ckpt_name = os.path.basename(primary_ckpt)
+    # Save — name encodes prompt combination
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(output_dir,
-                            f"medqa_grpo_{ckpt_name}_{ts}.json")
+    out_file = os.path.join(output_dir, f"medqa_{combo_tag}_{ts}.json")
     with open(out_file, "w") as f:
         json.dump({"summary": summary, "results": results},
                   f, indent=2, ensure_ascii=False)
     print(f"✓ Saved: {out_file}")
 
-    return summary
+    return {"combo": combo_tag, "accuracy": accuracy,
+            "correct": correct, "total": total, "file": out_file}
+
+
+def run_hypothesis_combo(
+    args: argparse.Namespace,
+    corpus_name: str,
+    model_name: str,
+    hypothesis_prompt: str,
+    rewriting_prompt: str,
+    generator_prompt: str,
+) -> Dict[str, Any]:
+    """Execute one hypothesis-mode run (OpenAI or local vLLM backend)."""
+    if args.llm_provider == "openai":
+        return asyncio.run(run_batch_phased_evaluation_openai(
+            base_model=model_name,
+            rewriter_checkpoint=args.rewriter_checkpoint,
+            hypothesis_checkpoint=args.hypothesis_checkpoint,
+            max_questions=args.max_questions,
+            total_docs=args.total_docs,
+            max_tokens=args.vllm_max_tokens,
+            max_concurrent=args.max_concurrent,
+            output_dir=args.output_dir,
+            retriever_name=args.retriever,
+            corpus_name=corpus_name,
+            hypothesis_prompt=hypothesis_prompt,
+            rewriting_prompt=rewriting_prompt,
+            generator_prompt=generator_prompt,
+            api_base=args.api_base,
+        ))
+
+    return run_batch_phased_evaluation(
+        base_model=model_name,
+        rewriter_checkpoint=args.rewriter_checkpoint,
+        hypothesis_checkpoint=args.hypothesis_checkpoint,
+        max_questions=args.max_questions,
+        total_docs=args.total_docs,
+        gpu_mem=args.vllm_gpu_memory_utilization,
+        max_model_len=args.vllm_max_model_len,
+        max_tokens=args.vllm_max_tokens,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        output_dir=args.output_dir,
+        retriever_name=args.retriever,
+        corpus_name=corpus_name,
+        hypothesis_prompt=hypothesis_prompt,
+        rewriting_prompt=rewriting_prompt,
+        generator_prompt=generator_prompt,
+    )
+
+
+def resolve_hypothesis_combo_triplets(
+    args: argparse.Namespace,
+) -> List[Tuple[str, str, str]]:
+    """Resolve hypothesis/rewriter/generator prompt combinations for ablation."""
+    if args.run_all:
+        return [
+            (hypothesis_version, rewrite_version, "v1")
+            for hypothesis_version in ["v1", "v2", "v3"]
+            for rewrite_version in ["v1", "v2", "v3"]
+        ]
+
+    combo_tokens = args.ablation_combos or [
+        f"{args.hypothesis_prompt}-{args.rewriting_prompt}-{args.generator_prompt}"
+    ]
+    return parse_ablation_combo_tokens(
+        combo_tokens,
+        default_generator_prompt=args.generator_prompt,
+    )
+
+
+def save_ablation_summary_csv(
+    summary_rows: List[Dict[str, Any]],
+    output_dir: Optional[str],
+    llm_provider: str,
+) -> str:
+    """Save aggregate ablation metrics as CSV and return file path."""
+    import csv
+
+    summary_dir = resolve_ablation_summary_dir(
+        output_dir=output_dir,
+        llm_provider=llm_provider,
+    )
+    os.makedirs(summary_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_file = os.path.join(summary_dir, f"ablation_summary_{timestamp}.csv")
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["model", "combo", "accuracy", "correct", "total", "file"],
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    return csv_file
+
+
+def run_hypothesis_mode(args: argparse.Namespace, corpus_name: str) -> None:
+    """Entry point for hypothesis mode: single combo or multi-run ablation."""
+    run_ablation = bool(
+        args.run_all or args.ablation_models is not None
+        or args.ablation_combos is not None
+    )
+
+    if not run_ablation:
+        run_hypothesis_combo(
+            args=args,
+            corpus_name=corpus_name,
+            model_name=args.model,
+            hypothesis_prompt=args.hypothesis_prompt,
+            rewriting_prompt=args.rewriting_prompt,
+            generator_prompt=args.generator_prompt,
+        )
+        return
+
+    combo_triplets = resolve_hypothesis_combo_triplets(args)
+    model_names = args.ablation_models or [args.model]
+    summary_rows = []
+
+    total_runs = len(model_names) * len(combo_triplets)
+    run_idx = 0
+
+    print(f"\n{'#'*70}")
+    print(f"Running ablation: {len(model_names)} model(s) x "
+          f"{len(combo_triplets)} combo(s) = {total_runs} run(s)")
+    print(f"{'#'*70}")
+
+    for model_name in model_names:
+        for hv, rv, gv in combo_triplets:
+            run_idx += 1
+            print(f"\n\n{'#'*70}")
+            print(
+                f"  Run {run_idx}/{total_runs}: model={model_name}, "
+                f"hypothesis={hv}, rewriting={rv}, generator={gv}"
+            )
+            print(f"{'#'*70}")
+            result = run_hypothesis_combo(
+                args=args,
+                corpus_name=corpus_name,
+                model_name=model_name,
+                hypothesis_prompt=hv,
+                rewriting_prompt=rv,
+                generator_prompt=gv,
+            )
+            summary_rows.append({
+                "model": model_name,
+                **result,
+            })
+
+    print(f"\n\n{'='*90}")
+    print("ABLATION SUMMARY")
+    print(f"{'='*90}")
+    print(f"{'Model':<28} {'Combo':<15} {'Accuracy':>10} {'Correct':>10} {'Total':>8}")
+    print(f"{'-'*28} {'-'*15} {'-'*10} {'-'*10} {'-'*8}")
+    for row in summary_rows:
+        print(f"{_slugify(row['model']):<28} {row['combo']:<15} "
+              f"{row['accuracy']:>9.2f}% {row['correct']:>10} {row['total']:>8}")
+    print(f"{'='*90}")
+
+    csv_file = save_ablation_summary_csv(
+        summary_rows=summary_rows,
+        output_dir=args.output_dir,
+        llm_provider=args.llm_provider,
+    )
+    print(f"✓ Summary CSV saved: {csv_file}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MedQA Max Async Parallel Evaluation",
+        description='MedQA RAG Evaluation v2 (Prompt-Selectable Ablation)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 Examples:
-  # CoT baseline only (no RAG)
-  python evaluate_medqa.py --modes cot --max-questions 1273
+  # Hypothesis mode with specific prompts
+  python scripts/evaluate/evaluate.py --mode hypothesis \\
+      --hypothesis-prompt v1 --rewriting-prompt v2 --generator-prompt v1 \\
+      --model Qwen/Qwen3-4B-Instruct-2507 --max-questions 1273
 
-  # RAG modes only
-  python evaluate_medqa.py --modes direct baseline planning --max-questions 1273
+  # Run all 9 hypothesis×rewriting combos (generator=v1)
+  python scripts/evaluate/evaluate.py --mode hypothesis --run-all \\
+      --model Qwen/Qwen3-4B-Instruct-2507 --max-questions 1273
 
-  # All modes including CoT
-  python evaluate_medqa.py --modes cot direct baseline planning --max-questions 100
+  # With checkpoints
+  python scripts/evaluate/evaluate.py --mode hypothesis \\
+      --hypothesis-prompt v1 --rewriting-prompt v1 \\
+      --model Qwen/Qwen3-4B-Instruct-2507 \\
+      --hypothesis-checkpoint /path/to/checkpoint-1100
 
-  # Quick test (10 questions)
-  python evaluate_medqa.py --max-questions 10
+  # Baseline modes (cot, directrag, directrewriting)
+  python scripts/evaluate/evaluate.py --mode cot --max-questions 1273
+  python scripts/evaluate/evaluate.py --mode directrag --max-questions 1273
+  python scripts/evaluate/evaluate.py --mode directrewriting --max-questions 1273
 
-  # Full RAG evaluation with max parallelism
-  python evaluate_medqa.py --max-questions 1273 --max-concurrent 100
-
-  python evaluate_medqa.py --max-questions 1273 --modes planning_v4_grpo --model Qwen/Qwen3-4B-Instruct-2507 --hypothesis-checkpoint /home/bispl_02/hangeol/HypothesisRAG/outputs/hypothesis_grpo_lora/20260225_012054/checkpoint-1100 --rewriter-checkpoint /home/bispl_02/hangeol/HypothesisRAG/output/medqa_grpo_rewriter_adapter_v4_grpo_20260228_021346/checkpoint-1000
+  # Prompt/model ablation (replaces old run_gpt_ablation.py)
+  python scripts/evaluate/evaluate.py --mode hypothesis --llm-provider openai \
+      --ablation-models gpt-4o-mini gpt-4o \
+      --ablation-combos v5-v5-v2 v7-v10-v2 \
+      --max-questions 1273
         """
     )
-    
-    parser.add_argument('--max-questions', '-n', type=int, default=2000)
-    parser.add_argument('--max-concurrent', '-c', type=int, default=100,
-                       help='Max concurrent API requests (default: 100)')
-    parser.add_argument('--llm-provider', type=str, default='openai', choices=['openai', 'vllm'],
-                       help='LLM backend provider: openai API or local vLLM')
-    parser.add_argument('--modes', '-m', nargs='+', 
-                       choices=['cot', 'direct', 'baseline', 'planning', 'planning_v2', 'planning_v3', 'planning_v4', 'planning_v4_grpo', 'planning_v5', 'planning_v6'],
-                       default=['direct', 'baseline', 'planning'],
-                       help='Modes: v2=diagnostic, v3=adaptive, v4=answer-focused, v4_grpo=GRPO-trained rewriter, v5=plan+queries, v6=dual-hypothesis')
+
+    # ── Mode selection ──
+    parser.add_argument(
+        '--mode', type=str, default='hypothesis',
+        choices=['cot', 'directrag', 'directrewriting', 'hypothesis', 'direct', 'baseline'],
+        help=('Evaluation mode (default: hypothesis). '
+              'Legacy aliases: direct->directrag, baseline->directrewriting'))
+    parser.add_argument(
+        '--hypothesis-prompt', type=str, default='v1',
+        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'],
+        help='Hypothesis prompt version (default: v1)')
+    parser.add_argument(
+        '--rewriting-prompt', type=str, default='v1',
+        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'],
+        help='Rewriting prompt version (default: v1)')
+    parser.add_argument(
+        '--generator-prompt', type=str, default='v1',
+        choices=['v1', 'v2'],
+        help='Generator prompt version (default: v1)')
+    parser.add_argument(
+        '--run-all', action='store_true',
+        help='Run all 9 hypothesis×rewriting combos with generator=v1')
+    parser.add_argument(
+        '--ablation-models', nargs='+', default=None,
+        help='Run multiple models in one command (hypothesis mode only).')
+    parser.add_argument(
+        '--ablation-combos', nargs='+', default=None,
+        help=("Prompt combos for hypothesis mode: 'vH-vR' or 'vH-vR-vG' "
+              "(e.g., v5-v5-v2 v7-v10-v2)."))
+
+    # ── Model & checkpoints ──
     parser.add_argument('--model', type=str, default='gpt-4o-mini')
-    parser.add_argument('--retriever', type=str, default='MedCPT')
+    parser.add_argument('--hypothesis-checkpoint', type=str, default=None,
+                       help='Path to hypothesis checkpoint (Phase 1 model)')
     parser.add_argument('--rewriter-checkpoint', type=str, default=None,
-                       help='Path to GRPO-trained rewriter checkpoint (required for planning_v4_grpo mode)')
+                       help='Path to rewriter checkpoint (Phase 2 model)')
     parser.add_argument('--rewriter-base-model', type=str, default=None,
-                       help='Base model for GRPO rewriter (defaults to --model)')
+                       help='Base model for rewriter (defaults to --model)')
+
+    # ── Evaluation settings ──
+    parser.add_argument('--max-questions', '-n', type=int, default=1273)
+    parser.add_argument('--max-concurrent', '-c', type=int, default=100)
+    parser.add_argument('--llm-provider', type=str, default='openai',
+                       choices=['openai', 'vllm'])
+    parser.add_argument('--retriever', type=str, default='MedCPT')
     parser.add_argument(
         '--retrieval-dataset',
         type=parse_retrieval_dataset,
         default=RETRIEVAL_DATASET_TO_CORPUS["textbooks"],
         metavar='{textbooks,pubmed}',
-        help='Retrieval dataset for RAG modes (default: textbooks)',
+        help='Retrieval dataset (default: textbooks)')
+    parser.add_argument('--corpus', type=str, default=None,
+                       help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--output-dir', '-o', type=str, default=None,
+        help='Optional output directory. If omitted, uses outputs/results/<provider>/<model>/'
     )
-    # Backward compatibility: keep old flag, but prefer --retrieval-dataset.
-    parser.add_argument('--corpus', type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument('--output-dir', '-o', type=str, default='outputs')
-    parser.add_argument('--api-base', type=str, default=None,
-                       help='Custom API base URL (e.g. http://localhost:18081/v1 for local vLLM server)')
+    parser.add_argument('--api-base', type=str, default=None)
+    parser.add_argument('--total-docs', type=int, default=15)
+
+    # ── vLLM settings ──
     parser.add_argument('--vllm-tensor-parallel-size', type=int, default=1)
-    parser.add_argument('--vllm-gpu-memory-utilization', type=float, default=0.9)
+    parser.add_argument('--vllm-gpu-memory-utilization', type=float,
+                       default=0.9)
     parser.add_argument('--vllm-max-tokens', type=int, default=2048)
-    parser.add_argument('--vllm-max-concurrent', type=int, default=1,
-                       help='Concurrent local generations when using vLLM backend (keep 1 for stability)')
-    parser.add_argument('--vllm-max-model-len', type=int, default=8192,
-                       help='Maximum model context length for vLLM (default: 8192)')
-    parser.add_argument('--total-docs', type=int, default=15,
-                       help='Total documents to retrieve per RAG mode (default: 15)')
-    parser.add_argument('--hypothesis-checkpoint', type=str, default=None,
-                       help='Path to hypothesis checkpoint (Phase 1 model for planning_v4_grpo)')
-    
+    parser.add_argument('--vllm-max-concurrent', type=int, default=1)
+    parser.add_argument('--vllm-max-model-len', type=int, default=8192)
+
     args = parser.parse_args()
-    
+    args.mode = normalize_mode_name(args.mode)
     corpus_name = args.corpus if args.corpus else args.retrieval_dataset
 
-    # Use batch-phased evaluation for planning_v4_grpo mode
-    if args.modes == ['planning_v4_grpo']:
-        run_batch_phased_evaluation(
-            base_model=args.model,
-            rewriter_checkpoint=args.rewriter_checkpoint,
-            hypothesis_checkpoint=args.hypothesis_checkpoint,
-            max_questions=args.max_questions,
-            total_docs=args.total_docs,
-            gpu_mem=args.vllm_gpu_memory_utilization,
-            max_model_len=args.vllm_max_model_len,
-            max_tokens=args.vllm_max_tokens,
-            output_dir=args.output_dir,
-            retriever_name=args.retriever,
-            corpus_name=corpus_name,
-        )
-    else:
-        # Run async evaluation
-        asyncio.run(run_evaluation_async(
-            max_questions=args.max_questions,
-            llm_provider=args.llm_provider,
-            model_name=args.model,
-            retriever_name=args.retriever,
-            corpus_name=corpus_name,
-            max_concurrent=args.max_concurrent,
-            output_dir=args.output_dir,
-            modes=args.modes,
-            vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-            vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            vllm_max_tokens=args.vllm_max_tokens,
-            vllm_max_concurrent=args.vllm_max_concurrent,
-            vllm_max_model_len=args.vllm_max_model_len,
-            total_docs=args.total_docs,
-            rewriter_adapter_path=args.rewriter_checkpoint,
-            rewriter_base_model=args.rewriter_base_model,
-            api_base=args.api_base,
-        ))
+    if args.mode == 'hypothesis':
+        run_hypothesis_mode(args, corpus_name)
+        return
+
+    # ── Baseline modes (cot, directrag, directrewriting) via async evaluator ──
+    asyncio.run(run_evaluation_async(
+        max_questions=args.max_questions,
+        llm_provider=args.llm_provider,
+        model_name=args.model,
+        retriever_name=args.retriever,
+        corpus_name=corpus_name,
+        max_concurrent=args.max_concurrent,
+        output_dir=args.output_dir,
+        modes=[args.mode],
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_tokens=args.vllm_max_tokens,
+        vllm_max_concurrent=args.vllm_max_concurrent,
+        vllm_max_model_len=args.vllm_max_model_len,
+        total_docs=args.total_docs,
+        # Baseline path uses the base model for query rewriting.
+        rewriter_adapter_path=None,
+        rewriter_base_model=None,
+        api_base=args.api_base,
+    ))
 
 
 if __name__ == "__main__":

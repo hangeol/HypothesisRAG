@@ -23,7 +23,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 
 # Import prompts from central prompts.py
-from prompts import HYPOTHESIS_PROMPTS, REWRITING_PROMPTS
+from core.prompts import HYPOTHESIS_PROMPTS, REWRITING_PROMPTS
 
 
 # ============================================================================
@@ -81,7 +81,7 @@ Output in JSON:
 
 
 # ============================================================================
-# Plan generation prompt (same as PLANNING_V4_PROMPT in evaluate_medqa.py)
+# Plan generation prompt (legacy-compatible with scripts/past/evaluate_past.py)
 # ============================================================================
 PLANNING_V4_PROMPT = """You are an expert medical diagnostician taking a medical licensing exam.
 
@@ -297,15 +297,32 @@ def format_rewriter_prompt(
     r_prompt = REWRITING_PROMPTS[rewriting_prompt_version]
     options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
 
-    # Provide all possible format variables (extras are silently ignored)
+    # Keep compatibility across prompt versions (v1..v10) with different keys.
+    best_guess = (plan.get("best_guess", "") or "").strip().upper().rstrip(".")
+    if plan.get("best_guess_text"):
+        best_guess_text = str(plan.get("best_guess_text"))
+    elif best_guess in options:
+        best_guess_text = f"{best_guess}. {options[best_guess]}"
+    else:
+        best_guess_text = best_guess
+
+    alt_guess = (plan.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
+    if alt_guess in options:
+        alternative_text = f"{alt_guess}. {options[alt_guess]}"
+    else:
+        alternative_text = alt_guess
+
+    # Provide all possible format variables.
     user_msg = r_prompt["user"].format(
         question=question,
         options=options_text,
-        best_guess=plan.get("best_guess", ""),
+        best_guess=best_guess,
+        best_guess_text=best_guess_text,
         reasoning=plan.get("reasoning", ""),
         confirming_evidence=_format_list(plan.get("confirming_evidence", [])),
         discriminating_features=_format_list(plan.get("discriminating_features", [])),
-        alternative_if_wrong=plan.get("alternative_if_wrong", ""),
+        alternative_if_wrong=alt_guess,
+        alternative_text=alternative_text,
     )
 
     return [

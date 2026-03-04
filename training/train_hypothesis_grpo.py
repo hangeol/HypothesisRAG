@@ -162,12 +162,12 @@ def parse_args():
         help="Run 5 questions with G=2, no weight updates — validate pipeline"
     )
 
-    # Compatibility options if you run from run_training.sh with shared flags.
+    # Compatibility options if you run from scripts/train/run_training.sh with shared flags.
     parser.add_argument("--hypothesis_temperature", type=float, default=0.0)
     parser.add_argument("--planner_tp", type=int, default=1)
     parser.add_argument("--plan_cache_path", type=str, default=None)
 
-    # Prompt version selection (matches evaluate_medqa_v2.py)
+    # Prompt version selection (matches scripts/evaluate/evaluate.py)
     parser.add_argument(
         "--hypothesis_prompt", type=str, default="v6",
         help="Hypothesis prompt version for plan generation (default: v6)"
@@ -187,7 +187,7 @@ def parse_args():
 def check_rag_connection(retriever_name: str, corpus_name: str):
     print("\n[0/3] Checking RAG connection...")
     try:
-        from retriever import create_retriever
+        from retrieval.retriever import create_retriever
         retriever_instance = create_retriever(
             retriever_type="mirage",
             retriever_name=retriever_name,
