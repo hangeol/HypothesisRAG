@@ -41,6 +41,7 @@ for p in [
         sys.path.insert(0, p)
 
 from retrieval.retriever import create_retriever
+from retrieval.reranking import DocumentReranker
 from core.prompts import (
     load_mirage_prompts,
     get_evaluate_prompt_bundle,
@@ -541,6 +542,10 @@ class AsyncRAGEvaluator:
         rewriter_adapter_path: Optional[str] = None,
         rewriter_base_model: Optional[str] = None,
         api_base: Optional[str] = None,
+        use_reranker: bool = False,
+        reranker_model: str = "BAAI/bge-reranker-v2-m3",
+        reranker_device: str = "cpu",
+        reranker_batch_size: int = 16,
     ):
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
@@ -618,6 +623,16 @@ class AsyncRAGEvaluator:
             retriever_name=retriever_name,
             corpus_name=corpus_name,
         )
+        
+        # Initialize reranker if enabled
+        self.use_reranker = use_reranker
+        self.reranker_batch_size = reranker_batch_size
+        self.reranker = None
+        if self.use_reranker:
+            self.reranker = DocumentReranker(
+                model_name=reranker_model, 
+                device=reranker_device
+            )
     
     def retrieve_documents(
         self,
@@ -652,6 +667,18 @@ class AsyncRAGEvaluator:
             doc = doc_data[doc_id]
             doc["fused_score"] = doc_scores[doc_id]
             retrieved_docs.append(doc)
+            
+        if self.use_reranker and self.reranker and len(retrieved_docs) > 0:
+            # We use the first query as the reranking anchor
+            rerank_query = queries[0] if queries else ""
+            retrieved_docs = self.reranker.rerank(
+                query=rerank_query, 
+                docs=retrieved_docs, 
+                top_k=self.total_docs,
+                batch_size=self.reranker_batch_size
+            )
+        else:
+            retrieved_docs = retrieved_docs[:self.total_docs]
         
         return retrieved_docs
     
@@ -1488,21 +1515,24 @@ Based on the initial analysis and the retrieved evidence, please provide your fi
                         directrewriting_queries = query_outputs[i]
 
                 total_docs = self.total_docs
+                retrieval_limit = total_docs * 10 if self.use_reranker else total_docs
                 directrag_docs: List[Dict[str, Any]] = []
                 directrewriting_docs: List[Dict[str, Any]] = []
                 if "directrag" in rag_modes:
                     directrag_docs = self.retrieve_documents(
                         [question],
-                        total_docs,
-                        max_docs=total_docs,
+                        retrieval_limit,
+                        max_docs=retrieval_limit,
                     )
                 if "directrewriting" in rag_modes and directrewriting_queries:
-                    # Fixed setting: 3 subqueries × 5 docs per query = 15 docs.
-                    k = DIRECT_REWRITING_DOCS_PER_QUERY
+                    # Depending on rerun strategy, we pass the 10x max limit for fusion gathering
+                    # The retrieve_documents method already scales the initial returns.
+                    # We pass the per-query amount (which isn't necessarily 10x directly multiplied).
+                    k = DIRECT_REWRITING_DOCS_PER_QUERY * (10 if self.use_reranker else 1)
                     directrewriting_docs = self.retrieve_documents(
                         directrewriting_queries,
                         k,
-                        max_docs=DIRECT_REWRITING_TOTAL_DOCS,
+                        max_docs=DIRECT_REWRITING_TOTAL_DOCS * (10 if self.use_reranker else 1),
                     )
 
                 answer_tasks = []
@@ -1578,6 +1608,10 @@ async def run_evaluation_async(
     rewriter_adapter_path: Optional[str] = None,
     rewriter_base_model: Optional[str] = None,
     api_base: Optional[str] = None,
+    use_reranker: bool = False,
+    reranker_model: str = "BAAI/bge-reranker-v2-m3",
+    reranker_device: str = "cpu",
+    reranker_batch_size: int = 16,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     openai_api_key = None
@@ -1659,6 +1693,10 @@ async def run_evaluation_async(
         vllm_max_concurrent=vllm_max_concurrent,
         vllm_max_model_len=vllm_max_model_len,
         api_base=api_base,
+        use_reranker=use_reranker,
+        reranker_model=reranker_model,
+        reranker_device=reranker_device,
+        reranker_batch_size=reranker_batch_size,
     )
     
     if rag_modes:
@@ -2652,6 +2690,15 @@ def run_batch_phased_evaluation(
         )
         if hasattr(retriever, "_lazy_init"):
             retriever._lazy_init()
+        
+        # Init reranker if enabled
+        reranker = None
+        if use_reranker:
+            from retrieval.reranking import DocumentReranker
+            reranker = DocumentReranker(
+                model_name=reranker_model,
+                device=reranker_device
+            )
     except Exception as e:
         print(f"  WARNING: Retriever init failed: {e}")
         retriever = None
@@ -2661,7 +2708,8 @@ def run_batch_phased_evaluation(
         doc_scores: Dict[str, float] = {}
         doc_data: Dict[str, Dict[str, Any]] = {}
         if retriever:
-            k_per = max(1, total_docs // max(len(queries), 1))
+            multiplier = 10 if use_reranker else 1
+            k_per = max(1, (total_docs * multiplier) // max(len(queries), 1))
             for q in queries:
                 try:
                     docs, scores = retriever.retrieve(q, k=k_per)
@@ -2689,6 +2737,17 @@ def run_batch_phased_evaluation(
             doc = doc_data[doc_id]
             doc["fused_score"] = doc_scores[doc_id]
             docs_sorted.append(doc)
+            
+        if use_reranker and reranker and len(docs_sorted) > 0:
+            rerank_query = queries[0] if queries else ""
+            docs_sorted = reranker.rerank(
+                query=rerank_query,
+                docs=docs_sorted,
+                top_k=total_docs,
+                batch_size=reranker_batch_size
+            )
+        else:
+            docs_sorted = docs_sorted[:total_docs]
 
         all_docs.append(docs_sorted)
         if (i + 1) % 200 == 0:
@@ -2859,6 +2918,10 @@ def run_hypothesis_combo(
             rewriting_prompt=rewriting_prompt,
             generator_prompt=generator_prompt,
             api_base=args.api_base,
+            use_reranker=args.use_reranker,
+            reranker_model=args.reranker_model,
+            reranker_device=args.reranker_device,
+            reranker_batch_size=args.reranker_batch_size,
         ))
 
     return run_batch_phased_evaluation(
@@ -2877,6 +2940,10 @@ def run_hypothesis_combo(
         hypothesis_prompt=hypothesis_prompt,
         rewriting_prompt=rewriting_prompt,
         generator_prompt=generator_prompt,
+        use_reranker=args.use_reranker,
+        reranker_model=args.reranker_model,
+        reranker_device=args.reranker_device,
+        reranker_batch_size=args.reranker_batch_size,
     )
 
 
@@ -3089,6 +3156,17 @@ Examples:
     parser.add_argument('--api-base', type=str, default=None)
     parser.add_argument('--total-docs', type=int, default=15)
 
+    # ── Reranker settings ──
+    parser.add_argument('--use-reranker', action='store_true',
+                       help='Whether to fetch 10x documents and use a reranker.')
+    parser.add_argument('--reranker-model', type=str, default='BAAI/bge-reranker-v2-m3',
+                       choices=['BAAI/bge-reranker-v2-m3', 'Qwen/Qwen3-Reranker-0.6B', 'ncbi/MedCPT-Cross-Encoder'],
+                       help='Reranker HuggingFace model identifier')
+    parser.add_argument('--reranker-device', type=str, default='cuda',
+                       help='Device to run reranking on (cuda or cpu). Use --reranker-device cpu if seeing OOM issues.')
+    parser.add_argument('--reranker-batch-size', type=int, default=16,
+                       help='Batch size for the reranker.')
+
     # ── vLLM settings ──
     parser.add_argument('--vllm-tensor-parallel-size', type=int, default=1)
     parser.add_argument('--vllm-gpu-memory-utilization', type=float,
@@ -3125,6 +3203,10 @@ Examples:
         rewriter_adapter_path=None,
         rewriter_base_model=None,
         api_base=args.api_base,
+        use_reranker=args.use_reranker,
+        reranker_model=args.reranker_model,
+        reranker_device=args.reranker_device,
+        reranker_batch_size=args.reranker_batch_size,
     ))
 
 
