@@ -15,11 +15,16 @@ class DocumentReranker:
         print(f"Loading reranker model {self.model_name} on {self.device}...")
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            
         # Load the model with sequence classification head
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             trust_remote_code=True
         )
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model.resize_token_embeddings(len(self.tokenizer))
         self.model.to(self.device)
         self.model.eval()
         print(f"Reranker {self.model_name} loaded successfully.")

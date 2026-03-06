@@ -368,6 +368,7 @@ class AsyncOpenAIClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "Accept-Encoding": "gzip, deflate", # Prevent brotli encoding errors
         }
         
         payload = {
@@ -544,7 +545,7 @@ class AsyncRAGEvaluator:
         api_base: Optional[str] = None,
         use_reranker: bool = False,
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
-        reranker_device: str = "cpu",
+        reranker_device: str = "cuda",
         reranker_batch_size: int = 16,
     ):
         self.llm_provider = llm_provider.lower()
@@ -1610,7 +1611,7 @@ async def run_evaluation_async(
     api_base: Optional[str] = None,
     use_reranker: bool = False,
     reranker_model: str = "BAAI/bge-reranker-v2-m3",
-    reranker_device: str = "cpu",
+    reranker_device: str = "cuda",
     reranker_batch_size: int = 16,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
@@ -2123,6 +2124,10 @@ async def run_batch_phased_evaluation_openai(
     rewriting_prompt: str = "v1",
     generator_prompt: str = "v1",
     api_base: Optional[str] = None,
+    use_reranker: bool = False,
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    reranker_device: str = "cuda:0",
+    reranker_batch_size: int = 256,
 ) -> Dict[str, Any]:
     """
     Batch-phased hypothesis evaluation via OpenAI API (GPT-compatible).
@@ -2318,6 +2323,15 @@ async def run_batch_phased_evaluation_openai(
             )
             if hasattr(retriever, "_lazy_init"):
                 retriever._lazy_init()
+            
+            # Init reranker if enabled
+            reranker = None
+            if use_reranker:
+                from retrieval.reranking import DocumentReranker
+                reranker = DocumentReranker(
+                    model_name=reranker_model,
+                    device=reranker_device
+                )
         except Exception as e:
             print(f"  WARNING: Retriever init failed: {e}")
             retriever = None
@@ -2327,7 +2341,8 @@ async def run_batch_phased_evaluation_openai(
             doc_scores: Dict[str, float] = {}
             doc_data: Dict[str, Dict[str, Any]] = {}
             if retriever:
-                k_per = max(1, total_docs // max(len(queries), 1))
+                multiplier = 10 if use_reranker else 1
+                k_per = max(1, (total_docs * multiplier) // max(len(queries), 1))
                 for q in queries:
                     try:
                         docs, scores = retriever.retrieve(q, k=k_per)
@@ -2353,6 +2368,17 @@ async def run_batch_phased_evaluation_openai(
                 doc = doc_data[doc_id]
                 doc["fused_score"] = doc_scores[doc_id]
                 docs_sorted.append(doc)
+
+            if use_reranker and reranker and len(docs_sorted) > 0:
+                rerank_query = queries[0] if queries else ""
+                docs_sorted = reranker.rerank(
+                    query=rerank_query,
+                    docs=docs_sorted,
+                    top_k=total_docs,
+                    batch_size=reranker_batch_size
+                )
+            else:
+                docs_sorted = docs_sorted[:total_docs]
 
             all_docs.append(docs_sorted)
             if (i + 1) % 200 == 0:
@@ -2529,6 +2555,10 @@ def run_batch_phased_evaluation(
     hypothesis_prompt: str = "v1",
     rewriting_prompt: str = "v1",
     generator_prompt: str = "v1",
+    use_reranker: bool = False,
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    reranker_device: str = "cuda:0",
+    reranker_batch_size: int = 256,
 ) -> Dict[str, Any]:
     """
     Batch-phased evaluation with selectable prompts.
