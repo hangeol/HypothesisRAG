@@ -208,10 +208,22 @@ def normalize_mode_list(modes: List[str]) -> List[str]:
 # ============================================================================
 # MedQA Dataset Loader
 # ============================================================================
+VALID_EVAL_DATASETS = ["medqa", "medmcqa", "mmlu", "pubmedqa", "bioasq"]
+
+
 class MedQADataset:
-    """MedQA Dataset loader"""
-    
-    def __init__(self, benchmark_path: Optional[str] = None):
+    """Benchmark Dataset loader (supports medqa, medmcqa, mmlu, pubmedqa, bioasq)"""
+
+    def __init__(
+        self,
+        benchmark_path: Optional[str] = None,
+        benchmark_key: str = "medqa",
+    ):
+        if benchmark_key not in VALID_EVAL_DATASETS:
+            raise ValueError(
+                f"Unknown benchmark_key '{benchmark_key}'. "
+                f"Choose one of: {VALID_EVAL_DATASETS}"
+            )
         if benchmark_path is None:
             possible_paths = [
                 os.path.join(PROJECT_ROOT, "MIRAGE", "benchmark.json"),
@@ -224,13 +236,20 @@ class MedQADataset:
                     break
             if benchmark_path is None:
                 raise FileNotFoundError(f"benchmark.json not found")
-        
+
         with open(benchmark_path, 'r', encoding='utf-8') as f:
             benchmark = json.load(f)
-        
-        self.dataset = benchmark["medqa"]
+
+        if benchmark_key not in benchmark:
+            raise KeyError(
+                f"Key '{benchmark_key}' not found in benchmark.json. "
+                f"Available keys: {list(benchmark.keys())}"
+            )
+
+        self.benchmark_key = benchmark_key
+        self.dataset = benchmark[benchmark_key]
         self.index = sorted(self.dataset.keys())
-        print(f"✓ Loaded {len(self)} MedQA questions")
+        print(f"✓ Loaded {len(self)} questions from '{benchmark_key}'")
     
     def __len__(self) -> int:
         return len(self.dataset)
@@ -1613,6 +1632,7 @@ async def run_evaluation_async(
     reranker_model: str = "BAAI/bge-reranker-v2-m3",
     reranker_device: str = "cuda",
     reranker_batch_size: int = 16,
+    benchmark_key: str = "medqa",
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
     openai_api_key = None
@@ -1674,7 +1694,7 @@ async def run_evaluation_async(
     print("=" * 80)
     
     # Load dataset
-    dataset = MedQADataset()
+    dataset = MedQADataset(benchmark_key=benchmark_key)
     total_questions = min(max_questions, len(dataset))
     
     # Initialize evaluator
@@ -1844,7 +1864,7 @@ async def run_evaluation_async(
     model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
     if not model_suffix:
         model_suffix = "model"
-    output_file = os.path.join(output_dir, f"medqa_{mode_suffix}_{model_suffix}_{timestamp}.json")
+    output_file = os.path.join(output_dir, f"{benchmark_key}_{mode_suffix}_{model_suffix}_{timestamp}.json")
     
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
@@ -2128,6 +2148,7 @@ async def run_batch_phased_evaluation_openai(
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     reranker_device: str = "cuda:0",
     reranker_batch_size: int = 256,
+    benchmark_key: str = "medqa",
 ) -> Dict[str, Any]:
     """
     Batch-phased hypothesis evaluation via OpenAI API (GPT-compatible).
@@ -2181,7 +2202,7 @@ async def run_batch_phased_evaluation_openai(
     os.makedirs(output_dir, exist_ok=True)
 
     # Load dataset
-    dataset = MedQADataset()
+    dataset = MedQADataset(benchmark_key=benchmark_key)
     n = min(max_questions, len(dataset))
     questions = [dataset[i] for i in range(n)]
     print(f"\n{'='*70}")
@@ -2559,6 +2580,7 @@ def run_batch_phased_evaluation(
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     reranker_device: str = "cuda:0",
     reranker_batch_size: int = 256,
+    benchmark_key: str = "medqa",
 ) -> Dict[str, Any]:
     """
     Batch-phased evaluation with selectable prompts.
@@ -2592,7 +2614,7 @@ def run_batch_phased_evaluation(
     os.makedirs(output_dir, exist_ok=True)
 
     # Load dataset
-    dataset = MedQADataset()
+    dataset = MedQADataset(benchmark_key=benchmark_key)
     n = min(max_questions, len(dataset))
     questions = [dataset[i] for i in range(n)]
     print(f"\n{'='*70}")
@@ -2930,6 +2952,7 @@ def run_hypothesis_combo(
     hypothesis_prompt: str,
     rewriting_prompt: str,
     generator_prompt: str,
+    benchmark_key: str = "medqa",
 ) -> Dict[str, Any]:
     """Execute one hypothesis-mode run (OpenAI or local vLLM backend)."""
     if args.llm_provider == "openai":
@@ -2952,6 +2975,7 @@ def run_hypothesis_combo(
             reranker_model=args.reranker_model,
             reranker_device=args.reranker_device,
             reranker_batch_size=args.reranker_batch_size,
+            benchmark_key=benchmark_key,
         ))
 
     return run_batch_phased_evaluation(
@@ -2974,6 +2998,7 @@ def run_hypothesis_combo(
         reranker_model=args.reranker_model,
         reranker_device=args.reranker_device,
         reranker_batch_size=args.reranker_batch_size,
+        benchmark_key=benchmark_key,
     )
 
 
@@ -3038,6 +3063,7 @@ def run_hypothesis_mode(args: argparse.Namespace, corpus_name: str) -> None:
             hypothesis_prompt=args.hypothesis_prompt,
             rewriting_prompt=args.rewriting_prompt,
             generator_prompt=args.generator_prompt,
+            benchmark_key=args.eval_dataset,
         )
         return
 
@@ -3069,6 +3095,7 @@ def run_hypothesis_mode(args: argparse.Namespace, corpus_name: str) -> None:
                 hypothesis_prompt=hv,
                 rewriting_prompt=rv,
                 generator_prompt=gv,
+                benchmark_key=args.eval_dataset,
             )
             summary_rows.append({
                 "model": model_name,
@@ -3128,6 +3155,11 @@ Examples:
     )
 
     # ── Mode selection ──
+    parser.add_argument(
+        '--eval-dataset', type=str, default='medqa',
+        choices=["medqa", "medmcqa", "mmlu", "pubmedqa", "bioasq"],
+        help='Evaluation dataset from benchmark.json (default: medqa)'
+    )
     parser.add_argument(
         '--mode', type=str, default='hypothesis',
         choices=['cot', 'directrag', 'directrewriting', 'hypothesis', 'direct', 'baseline'],
@@ -3237,6 +3269,7 @@ Examples:
         reranker_model=args.reranker_model,
         reranker_device=args.reranker_device,
         reranker_batch_size=args.reranker_batch_size,
+        benchmark_key=args.eval_dataset,
     ))
 
 
