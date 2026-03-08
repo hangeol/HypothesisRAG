@@ -11,7 +11,7 @@ Modes:
 For hypothesis mode, select prompt versions:
   --hypothesis-prompt  v1 | v2 | v3
   --rewriting-prompt   v1 | v2 | v3
-  --generator-prompt   v1 | v2
+  --generator-prompt   v1 | v2 | v3
   --run-all  runs all 9 hypothesis×rewriting combos (generator=v1)
 """
 
@@ -20,8 +20,12 @@ import sys
 import json
 import time
 import re
+import math
 import asyncio
 import argparse
+import random
+import csv
+import threading
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm.asyncio import tqdm_asyncio
@@ -42,7 +46,6 @@ for p in [
 
 from retrieval.retriever import create_retriever
 from core.prompts import (
-    load_mirage_prompts,
     get_evaluate_prompt_bundle,
 )
 
@@ -65,6 +68,20 @@ def parse_retrieval_dataset(value: str) -> str:
             f"Invalid retrieval dataset '{value}'. Choose one of: {allowed}"
         )
     return RETRIEVAL_DATASET_TO_CORPUS[normalized]
+
+
+QUESTION_DATASET_CHOICES = ("medqa", "pubmedqa", "medmcqa", "bioasq", "mmlu")
+
+
+def parse_question_dataset(value: str) -> str:
+    """Normalize question dataset input to benchmark key."""
+    normalized = value.strip().lower()
+    if normalized not in QUESTION_DATASET_CHOICES:
+        allowed = ", ".join(QUESTION_DATASET_CHOICES)
+        raise argparse.ArgumentTypeError(
+            f"Invalid question dataset '{value}'. Choose one of: {allowed}"
+        )
+    return normalized
 
 
 def _slugify(value: str) -> str:
@@ -153,18 +170,14 @@ def resolve_openai_api_key() -> Optional[str]:
             return match.group(1).strip()
     return None
 
-# Keep system prompts aligned with MIRAGE template when available.
-# This avoids divergence between local copied prompts and MIRAGE upstream text.
-if load_mirage_prompts():
-    print("✓ Loaded MIRAGE prompts from template.py")
-else:
-    print("⚠ Using built-in prompts")
 
 # Resolve all prompt resources from a single bundle.
 PROMPT_BUNDLE = get_evaluate_prompt_bundle()
 HYPOTHESIS_PROMPTS = PROMPT_BUNDLE["hypothesis"]
 REWRITING_PROMPTS = PROMPT_BUNDLE["rewriter"]
 GENERATOR_PROMPTS = PROMPT_BUNDLE["generator"]
+TRUST_EVALUATOR_PROMPTS = PROMPT_BUNDLE["trust_evaluator"]
+HYPOTHESIS_FINALIZER_PROMPTS = PROMPT_BUNDLE["hypothesis_finalizer"]
 COT_SYSTEM_PROMPT = PROMPT_BUNDLE["system"]["cot"]
 MIRAGE_SYSTEM_PROMPT = PROMPT_BUNDLE["system"]["medrag"]
 COT_USER_PROMPT_TEMPLATE = PROMPT_BUNDLE["answer"]["cot_user"]
@@ -188,6 +201,10 @@ MODE_ALIASES = {
     "baseline": "directrewriting",
 }
 
+EVAL_FIXED_TEMPERATURE = 0.0
+EVAL_FIXED_SEED = 42
+EVAL_FIXED_DO_SAMPLE = False
+
 
 def normalize_mode_name(mode: str) -> str:
     return MODE_ALIASES.get(mode, mode)
@@ -203,14 +220,207 @@ def normalize_mode_list(modes: List[str]) -> List[str]:
             normalized.append(mapped)
     return normalized
 
+def set_global_seed(seed: int) -> None:
+    """Best-effort reproducibility setup across common libraries."""
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except Exception:
+        pass
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
+def coerce_choice(value: Any) -> str:
+    text = str(value or "").upper()
+    match = re.findall(r"\b([ABCD])\b", text)
+    return match[-1] if match else ""
+
+
+def coerce_confidence_level(value: Any, default: int = 2) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value in (1, 2, 3) else default
+    m = re.search(r"\b([123])\b", str(value or ""))
+    if m:
+        return int(m.group(1))
+    return default
+
+
+def should_use_retrieval(confidence_level: int, gating_policy: str) -> bool:
+    """Return whether to use retrieval path under the selected gating policy."""
+    conf = coerce_confidence_level(confidence_level, default=2)
+    if gating_policy == "conf3_skip":
+        return conf in (1, 2)
+    if gating_policy == "conf23_skip":
+        return conf == 1
+    if gating_policy == "conf3_only_retrieve":
+        return conf == 3
+    raise ValueError(f"Unknown gating policy: {gating_policy}")
+
+
+def is_high_trust(trust_level: int, trust_threshold: int) -> bool:
+    """Return whether trust evaluator score is considered high-trust."""
+    level = coerce_confidence_level(trust_level, default=2)
+    threshold = coerce_confidence_level(trust_threshold, default=3)
+    return level >= threshold
+
+
+def _retrieve_fused_docs_for_query_set(
+    retriever,
+    query_set: List[str],
+    total_docs: int,
+) -> List[Dict[str, Any]]:
+    """Retrieve docs for one query set and fuse by summed score."""
+    if not retriever:
+        return []
+    doc_scores: Dict[str, float] = {}
+    doc_data: Dict[str, Dict[str, Any]] = {}
+    if not query_set:
+        return []
+
+    k_per = max(1, total_docs // max(len(query_set), 1))
+    for query in query_set:
+        try:
+            docs, scores = retriever.retrieve(query, k=k_per)
+            for doc, score in zip(docs, scores):
+                doc_id = doc.get(
+                    "id",
+                    doc.get("title", str(hash(doc.get("content", "")[:100]))),
+                )
+                if doc_id not in doc_scores:
+                    doc_scores[doc_id] = 0.0
+                    doc_data[doc_id] = doc.copy()
+                    doc_data[doc_id]["query_trace"] = []
+                try:
+                    doc_scores[doc_id] += float(score)
+                except Exception:
+                    doc_scores[doc_id] += 0.0
+                doc_data[doc_id]["query_trace"].append(query)
+        except Exception:
+            pass
+
+    docs_sorted = []
+    for doc_id in sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True):
+        doc = doc_data[doc_id]
+        doc["fused_score"] = doc_scores[doc_id]
+        docs_sorted.append(doc)
+    return docs_sorted
+
+
+def _to_json_safe(value: Any) -> Any:
+    """Convert nested values into JSON-serializable primitives."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            out[str(k)] = _to_json_safe(v)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return _to_json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _serialize_retrieved_docs_for_output(
+    docs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep retrieval evidence in output JSON with stable, safe fields."""
+    export_keys = [
+        "id",
+        "doc_id",
+        "chunk_id",
+        "title",
+        "source",
+        "content",
+        "text",
+        "score",
+        "fused_score",
+        "query_trace",
+        "metadata",
+    ]
+    serialized: List[Dict[str, Any]] = []
+    for idx, doc in enumerate(docs):
+        if not isinstance(doc, dict):
+            serialized.append(
+                {
+                    "id": f"doc_{idx+1}",
+                    "content": _to_json_safe(doc),
+                }
+            )
+            continue
+
+        row: Dict[str, Any] = {}
+        for key in export_keys:
+            if key in doc:
+                row[key] = _to_json_safe(doc.get(key))
+
+        if "id" not in row:
+            row["id"] = str(
+                doc.get("id")
+                or doc.get("chunk_id")
+                or doc.get("doc_id")
+                or f"doc_{idx+1}"
+            )
+        if "title" not in row and doc.get("title") is not None:
+            row["title"] = _to_json_safe(doc.get("title"))
+
+        if "content" not in row:
+            if doc.get("content") is not None:
+                row["content"] = _to_json_safe(doc.get("content"))
+            elif doc.get("text") is not None:
+                row["content"] = _to_json_safe(doc.get("text"))
+            else:
+                row["content"] = ""
+
+        serialized.append(row)
+    return serialized
+
+
+def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _write_summary_csv(path: str, row: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
+
 
 # ============================================================================
-# MedQA Dataset Loader
+# Benchmark Dataset Loader
 # ============================================================================
 class MedQADataset:
-    """MedQA Dataset loader"""
+    """benchmark.json dataset loader"""
     
-    def __init__(self, benchmark_path: Optional[str] = None):
+    def __init__(self, benchmark_path: Optional[str] = None, question_dataset: str = "medqa"):
         if benchmark_path is None:
             possible_paths = [
                 os.path.join(PROJECT_ROOT, "MIRAGE", "benchmark.json"),
@@ -226,10 +436,17 @@ class MedQADataset:
         
         with open(benchmark_path, 'r', encoding='utf-8') as f:
             benchmark = json.load(f)
-        
-        self.dataset = benchmark["medqa"]
+
+        if question_dataset not in benchmark:
+            raise KeyError(
+                f"Dataset '{question_dataset}' not found in benchmark.json. "
+                f"Available: {sorted(benchmark.keys())}"
+            )
+
+        self.question_dataset = question_dataset
+        self.dataset = benchmark[question_dataset]
         self.index = sorted(self.dataset.keys())
-        print(f"✓ Loaded {len(self)} MedQA questions")
+        print(f"✓ Loaded {len(self)} {question_dataset} questions")
     
     def __len__(self) -> int:
         return len(self.dataset)
@@ -308,8 +525,70 @@ def parse_subqueries(
                 query = match.group(1).strip()
                 if query and len(query) > 5:
                     queries.append(query)
-    
+
     return queries[:num_queries]
+
+
+def _expand_queries_to_target_count(
+    queries: List[str],
+    question: str,
+    target_count: int,
+) -> List[str]:
+    """Ensure deterministic query count by expanding with stable fallbacks."""
+    if target_count <= 0:
+        return []
+
+    cleaned: List[str] = []
+    seen = set()
+    for query in queries:
+        query_text = re.sub(r"\s+", " ", str(query)).strip()
+        if not query_text:
+            continue
+        key = query_text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(query_text)
+        if len(cleaned) >= target_count:
+            return cleaned[:target_count]
+
+    words = re.findall(r"\b[A-Za-z]{4,}\b", question)
+    anchor = " ".join(words[:3]) if words else question
+    fallback_candidates = [
+        question,
+        f"{anchor} symptoms diagnosis",
+        f"{anchor} differential diagnosis",
+        f"{anchor} diagnostic criteria",
+        f"{anchor} treatment",
+        f"{anchor} pathophysiology",
+        f"{anchor} risk factors",
+    ]
+
+    for candidate in fallback_candidates:
+        candidate_text = re.sub(r"\s+", " ", candidate).strip()
+        if not candidate_text:
+            continue
+        key = candidate_text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(candidate_text)
+        if len(cleaned) >= target_count:
+            return cleaned[:target_count]
+
+    # Absolute fallback: synthesize variants until target is met.
+    base = cleaned[0] if cleaned else question
+    suffixes = ["overview", "clinical features", "workup", "management", "prognosis"]
+    idx = 0
+    while len(cleaned) < target_count:
+        candidate_text = f"{base} {suffixes[idx % len(suffixes)]}".strip()
+        key = candidate_text.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(candidate_text)
+        idx += 1
+
+    return cleaned[:target_count]
 
 
 def parse_plan(content: str) -> Dict[str, Any]:
@@ -369,12 +648,19 @@ class AsyncOpenAIClient:
             "Content-Type": "application/json",
         }
         
+        _ = temperature
+        # GPT-5 family has stricter chat-completions params:
+        # - uses max_completion_tokens instead of max_tokens
+        # - temperature currently only supports default value, so omit it
+        is_gpt5_family = self.model.startswith("gpt-5")
+        token_param = "max_completion_tokens" if is_gpt5_family else "max_tokens"
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
-            "max_tokens": 2048,
+            token_param: 2048,
         }
+        if not is_gpt5_family:
+            payload["temperature"] = EVAL_FIXED_TEMPERATURE
 
         # For local vLLM servers: disable Qwen3 thinking mode to avoid
         # extremely long <think> chains that make requests take 10+ minutes.
@@ -427,7 +713,7 @@ class VLLMAsyncClient:
         self,
         model: str,
         max_concurrent: int = 1,
-        max_retries: int = 2,
+        max_retries: int = 1,
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_tokens: int = 2048,
@@ -437,8 +723,8 @@ class VLLMAsyncClient:
         self.model = model
         self.max_retries = max_retries
         self.max_tokens = max_tokens
-        # vLLM offline LLM is NOT thread-safe; serialize all calls
-        self.semaphore = asyncio.Semaphore(1)
+        # Allow configurable in-process request parallelism for local vLLM.
+        self.semaphore = asyncio.Semaphore(max(1, int(max_concurrent)))
 
         try:
             from vllm import LLM, SamplingParams
@@ -458,13 +744,26 @@ class VLLMAsyncClient:
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             trust_remote_code=trust_remote_code,
+            seed=EVAL_FIXED_SEED,
         )
-        self._sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=max_tokens,
-            stop=["###", "User:", "\n\n\n"],
-        )
+        try:
+            self._sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=max_tokens,
+                stop=["###", "User:", "\n\n\n"],
+                seed=EVAL_FIXED_SEED,
+            )
+        except TypeError:
+            # Older vLLM versions may not expose SamplingParams(seed=...).
+            self._sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=max_tokens,
+                stop=["###", "User:", "\n\n\n"],
+            )
         self._tokenizer = self._llm.get_tokenizer()
+        # vLLM LLM.generate is not thread-safe under high concurrent to_thread calls.
+        # Serialize generate() calls to avoid EngineCore socket corruption.
+        self._generate_lock = threading.Lock()
 
     def _format_prompt(self, messages: List[Dict[str, str]]) -> str:
         """Convert chat messages into a model prompt for vLLM"""
@@ -485,18 +784,34 @@ class VLLMAsyncClient:
 
     def _generate_sync(self, messages: List[Dict[str, str]], temperature: float) -> str:
         prompt = self._format_prompt(messages)
-        if temperature != 0.0:
-            sampling_params = self._SamplingParams(
-                temperature=temperature,
-                max_tokens=self.max_tokens,
-                stop=["###", "User:", "\n\n\n"],
+        _ = temperature
+        with self._generate_lock:
+            outputs = self._llm.generate(
+                [prompt],
+                sampling_params=self._sampling_params,
+                use_tqdm=True,
             )
-        else:
-            sampling_params = self._sampling_params
-        outputs = self._llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)
         if not outputs or not outputs[0].outputs:
             return ""
         return outputs[0].outputs[0].text
+
+    def _generate_batch_sync(
+        self,
+        messages_batch: List[List[Dict[str, str]]],
+        temperature: float,
+    ) -> List[str]:
+        prompts = [self._format_prompt(messages) for messages in messages_batch]
+        _ = temperature
+        with self._generate_lock:
+            outputs = self._llm.generate(
+                prompts,
+                sampling_params=self._sampling_params,
+                use_tqdm=True,
+            )
+        texts = _extract_vllm_output_texts(outputs)
+        if len(texts) < len(messages_batch):
+            texts.extend([""] * (len(messages_batch) - len(texts)))
+        return texts[:len(messages_batch)]
 
     async def chat_completion(
         self,
@@ -506,15 +821,46 @@ class VLLMAsyncClient:
     ) -> str:
         """Generate text using local vLLM (session kept for API compatibility)"""
         del session
+        temperature = EVAL_FIXED_TEMPERATURE
         async with self.semaphore:
             for attempt in range(self.max_retries):
                 try:
-                    return await asyncio.to_thread(self._generate_sync, messages, temperature)
+                    return await asyncio.to_thread(
+                        self._generate_sync,
+                        messages,
+                        temperature,
+                    )
                 except Exception as e:
                     if attempt == self.max_retries - 1:
                         return f"Error: {str(e)}"
                     await asyncio.sleep(1)
         return "Error: Max retries exceeded"
+
+    async def chat_completion_batch(
+        self,
+        messages_batch: List[List[Dict[str, str]]],
+        temperature: float = 0,
+        session: aiohttp.ClientSession = None,
+    ) -> List[str]:
+        """Generate a batch of completions with one vLLM generate() call."""
+        del session
+        if not messages_batch:
+            return []
+
+        temperature = EVAL_FIXED_TEMPERATURE
+        async with self.semaphore:
+            for attempt in range(self.max_retries):
+                try:
+                    return await asyncio.to_thread(
+                        self._generate_batch_sync,
+                        messages_batch,
+                        temperature,
+                    )
+                except Exception as e:
+                    if attempt == self.max_retries - 1:
+                        return [f"Error: {str(e)}"] * len(messages_batch)
+                    await asyncio.sleep(1)
+        return ["Error: Max retries exceeded"] * len(messages_batch)
 
 
 # ============================================================================
@@ -726,61 +1072,7 @@ class AsyncRAGEvaluator:
         question: str,
         target_count: int,
     ) -> List[str]:
-        """Ensure deterministic query count by expanding with stable fallbacks."""
-        if target_count <= 0:
-            return []
-
-        cleaned: List[str] = []
-        seen = set()
-        for query in queries:
-            query_text = re.sub(r"\s+", " ", str(query)).strip()
-            if not query_text:
-                continue
-            key = query_text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(query_text)
-            if len(cleaned) >= target_count:
-                return cleaned[:target_count]
-
-        words = re.findall(r"\b[A-Za-z]{4,}\b", question)
-        anchor = " ".join(words[:3]) if words else question
-        fallback_candidates = [
-            question,
-            f"{anchor} symptoms diagnosis",
-            f"{anchor} differential diagnosis",
-            f"{anchor} diagnostic criteria",
-            f"{anchor} treatment",
-            f"{anchor} pathophysiology",
-            f"{anchor} risk factors",
-        ]
-
-        for candidate in fallback_candidates:
-            candidate_text = re.sub(r"\s+", " ", candidate).strip()
-            if not candidate_text:
-                continue
-            key = candidate_text.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(candidate_text)
-            if len(cleaned) >= target_count:
-                return cleaned[:target_count]
-
-        # Absolute fallback: synthesize variants until target is met.
-        base = cleaned[0] if cleaned else question
-        suffixes = ["overview", "clinical features", "workup", "management", "prognosis"]
-        idx = 0
-        while len(cleaned) < target_count:
-            candidate_text = f"{base} {suffixes[idx % len(suffixes)]}".strip()
-            key = candidate_text.lower()
-            if key not in seen:
-                seen.add(key)
-                cleaned.append(candidate_text)
-            idx += 1
-
-        return cleaned[:target_count]
+        return _expand_queries_to_target_count(queries, question, target_count)
     
     # =========================================================================
     # Planning V2: Improved diagnostic reasoning approach
@@ -1110,7 +1402,7 @@ class AsyncRAGEvaluator:
         with torch.no_grad():
             outputs = self.grpo_rewriter_model.generate(
                 **inputs, max_new_tokens=256,
-                temperature=1.0, do_sample=False,
+                do_sample=EVAL_FIXED_DO_SAMPLE,
             )
         
         completion_ids = outputs[0][inputs["input_ids"].shape[1]:]
@@ -1574,12 +1866,27 @@ async def run_evaluation_async(
     vllm_max_tokens: int = 4096,
     vllm_max_concurrent: int = 1,
     vllm_max_model_len: int = 8192,
+    question_timeout_seconds: int = 600,
     total_docs: int = 15,
+    question_dataset: str = "medqa",
     rewriter_adapter_path: Optional[str] = None,
     rewriter_base_model: Optional[str] = None,
     api_base: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run maximum performance async evaluation with selectable modes"""
+    set_global_seed(EVAL_FIXED_SEED)
+    if modes is None:
+        modes = ["cot", "directrag", "directrewriting"]
+    modes = normalize_mode_list(modes)
+
+    allowed_modes = {"cot", "directrag", "directrewriting"}
+    invalid_modes = [mode for mode in modes if mode not in allowed_modes]
+    if invalid_modes:
+        raise ValueError(
+            f"Unsupported baseline mode(s): {invalid_modes}. "
+            f"Allowed: {sorted(allowed_modes)}"
+        )
+
     openai_api_key = None
     if llm_provider == "openai":
         openai_api_key = resolve_openai_api_key()
@@ -1593,19 +1900,7 @@ async def run_evaluation_async(
         llm_provider=llm_provider,
         model_name=model_name,
     )
-    
-    if modes is None:
-        modes = ["cot", "directrag", "directrewriting"]
-    modes = normalize_mode_list(modes)
 
-    allowed_modes = {"cot", "directrag", "directrewriting"}
-    invalid_modes = [mode for mode in modes if mode not in allowed_modes]
-    if invalid_modes:
-        raise ValueError(
-            f"Unsupported baseline mode(s): {invalid_modes}. "
-            f"Allowed: {sorted(allowed_modes)}"
-        )
-    
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
@@ -1614,11 +1909,21 @@ async def run_evaluation_async(
     print("=" * 80)
     print(f"LLM provider: {llm_provider}")
     print(f"Model: {model_name}")
+    print(f"Question dataset: {question_dataset}")
     print(f"Modes: {modes}")
     print(f"Max questions: {max_questions}")
-    print(f"Max concurrent requests: {max_concurrent}")
+    if llm_provider == "vllm":
+        print("Max concurrent requests: n/a (phased local vLLM baseline)")
+    else:
+        print(f"Max concurrent requests: {max_concurrent}")
+    print(f"Fixed seed: {EVAL_FIXED_SEED}")
+    print(f"Fixed temperature: {EVAL_FIXED_TEMPERATURE}")
+    print(f"Fixed do_sample: {EVAL_FIXED_DO_SAMPLE} (where supported)")
     if llm_provider == "vllm":
         print(f"vLLM settings: tp={vllm_tensor_parallel_size}, gpu_mem={vllm_gpu_memory_utilization}, max_model_len={vllm_max_model_len}, max_tokens={vllm_max_tokens}")
+        print("vLLM baseline batching: directrag/directrewriting run as phase batches.")
+    if llm_provider != "vllm":
+        print(f"Question timeout: {question_timeout_seconds}s")
     
     if "cot" in modes:
         print(f"CoT: No retrieval (Chain-of-Thought only)")
@@ -1639,8 +1944,10 @@ async def run_evaluation_async(
     print("=" * 80)
     
     # Load dataset
-    dataset = MedQADataset()
-    total_questions = min(max_questions, len(dataset))
+    dataset = MedQADataset(question_dataset=question_dataset)
+    capped_total = max(0, min(max_questions, len(dataset)))
+    question_indices = list(range(capped_total))
+    total_questions = len(question_indices)
     
     # Initialize evaluator
     evaluator = AsyncRAGEvaluator(
@@ -1674,58 +1981,280 @@ async def run_evaluation_async(
     # Create aiohttp session
     connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=max_concurrent)
     async with aiohttp.ClientSession(connector=connector) as session:
+        async def evaluate_with_timeout(question_data: Dict[str, Any], question_id: int) -> Dict[str, Any]:
+            try:
+                return await asyncio.wait_for(
+                    evaluator.evaluate_question_selected_modes(question_data, question_id, session, modes=modes),
+                    timeout=question_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                error_text = f"Error: Question timeout after {question_timeout_seconds}s"
+            except Exception as e:
+                error_text = f"Error: {str(e)}"
+
+            question = question_data.get("question", "")
+            options = question_data.get("options", {})
+            correct_answer = question_data.get("answer_idx", question_data.get("answer", ""))
+            return {
+                "question_id": question_id,
+                "question": question,
+                "options": options,
+                "correct_answer": correct_answer,
+                "error": error_text,
+                "modes": {
+                    mode: {
+                        "is_correct": False,
+                        "error": error_text,
+                    }
+                    for mode in modes
+                },
+            }
         
-        # Create all tasks at once
-        tasks = []
-        for i in range(total_questions):
-            question_data = dataset[i]
-            task = evaluator.evaluate_question_selected_modes(question_data, i, session, modes=modes)
-            tasks.append(task)
-        
-        # Estimate time based on mode complexity
-        api_calls_per_question = len([m for m in modes if m == "cot"])  # 1 for CoT
-        if "directrag" in modes:
-            api_calls_per_question += 1
-        if "directrewriting" in modes:
-            api_calls_per_question += 2  # subquery gen + answer
-        
-        # Run all tasks with progress bar
-        print(f"\nProcessing {total_questions} questions with {max_concurrent} concurrent requests...")
-        print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Estimated API calls: ~{total_questions * api_calls_per_question}")
-        print("=" * 80)
-        
-        completed_results = await tqdm_asyncio.gather(*tasks, desc="Evaluating")
-        
-        # Process results with periodic logging
-        for idx, result in enumerate(completed_results):
-            if result is None or isinstance(result, Exception):
-                continue
-            
-            results.append(result)
-            
-            for mode in modes:
-                mode_result = result.get("modes", {}).get(mode, {})
-                if "error" not in mode_result and "is_correct" in mode_result:
-                    mode_stats[mode]["total"] += 1
-                    if mode_result.get("is_correct", False):
-                        mode_stats[mode]["correct"] += 1
-            
-            # Print progress every 50 questions
-            if (idx + 1) % 50 == 0:
-                elapsed = time.time() - start_time
-                rate = (idx + 1) / elapsed
-                eta_seconds = (total_questions - idx - 1) / rate if rate > 0 else 0
-                
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Progress: {idx+1}/{total_questions} ({(idx+1)/total_questions*100:.1f}%)")
-                print(f"  Elapsed: {elapsed/60:.1f} min | Speed: {rate*60:.1f} q/min | ETA: {eta_seconds/60:.1f} min")
-                
+        if llm_provider == "vllm":
+            print(f"\nProcessing {total_questions} questions with phased vLLM batches...")
+            print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print("=" * 80)
+
+            questions = [dataset[question_id] for question_id in question_indices]
+            directrewriting_queries: List[List[str]] = [[] for _ in range(total_questions)]
+            directrag_docs: List[List[Dict[str, Any]]] = [[] for _ in range(total_questions)]
+            directrewriting_docs: List[List[Dict[str, Any]]] = [[] for _ in range(total_questions)]
+            raw_outputs_by_mode = {mode: [""] * total_questions for mode in modes}
+
+            batch_client = evaluator.client
+            if not hasattr(batch_client, "chat_completion_batch"):
+                raise RuntimeError("vLLM client does not support batch completions.")
+
+            if "directrewriting" in modes and questions:
+                query_messages = [
+                    _build_directrewriting_query_messages(qd["question"])
+                    for qd in questions
+                ]
+                query_texts = await batch_client.chat_completion_batch(
+                    query_messages,
+                    session=session,
+                )
+                for i, text in enumerate(query_texts):
+                    parsed_queries = parse_subqueries(
+                        text,
+                        DIRECT_REWRITING_TARGET_QUERIES,
+                    )
+                    directrewriting_queries[i] = _expand_queries_to_target_count(
+                        parsed_queries,
+                        questions[i]["question"],
+                        DIRECT_REWRITING_TARGET_QUERIES,
+                    )
+
+            if "directrag" in modes:
+                for i, qd in enumerate(questions):
+                    directrag_docs[i] = evaluator.retrieve_documents(
+                        [qd["question"]],
+                        total_docs,
+                        max_docs=total_docs,
+                    )
+
+            if "directrewriting" in modes:
+                for i, queries in enumerate(directrewriting_queries):
+                    directrewriting_docs[i] = evaluator.retrieve_documents(
+                        queries,
+                        DIRECT_REWRITING_DOCS_PER_QUERY,
+                        max_docs=DIRECT_REWRITING_TOTAL_DOCS,
+                    )
+
+            batched_jobs: List[Tuple[str, int, List[Dict[str, str]]]] = []
+            if "cot" in modes:
+                for i, qd in enumerate(questions):
+                    batched_jobs.append(
+                        ("cot", i, _build_cot_messages(qd["question"], qd["options"]))
+                    )
+            if "directrag" in modes:
+                for i, qd in enumerate(questions):
+                    batched_jobs.append(
+                        (
+                            "directrag",
+                            i,
+                            _build_medrag_answer_messages(
+                                qd["question"],
+                                qd["options"],
+                                directrag_docs[i],
+                            ),
+                        )
+                    )
+            if "directrewriting" in modes:
+                for i, qd in enumerate(questions):
+                    batched_jobs.append(
+                        (
+                            "directrewriting",
+                            i,
+                            _build_medrag_answer_messages(
+                                qd["question"],
+                                qd["options"],
+                                directrewriting_docs[i],
+                            ),
+                        )
+                    )
+
+            if batched_jobs:
+                batch_texts = await batch_client.chat_completion_batch(
+                    [job[2] for job in batched_jobs],
+                    session=session,
+                )
+                for (mode, question_idx, _), raw_text in zip(batched_jobs, batch_texts):
+                    raw_outputs_by_mode[mode][question_idx] = raw_text
+
+            for i, qd in enumerate(questions):
+                correct_answer = str(qd.get("answer_idx", qd.get("answer", "")) or "")
+                gold = correct_answer.upper()
+                result = {
+                    "question_id": question_indices[i],
+                    "question": qd["question"],
+                    "options": qd["options"],
+                    "correct_answer": correct_answer,
+                    "modes": {},
+                }
+
+                if "cot" in modes:
+                    raw_response = raw_outputs_by_mode["cot"][i]
+                    predicted = parse_answer(raw_response)
+                    is_correct = predicted.upper() == gold
+                    result["modes"]["cot"] = {
+                        "num_queries": 0,
+                        "num_docs": 0,
+                        "queries": [],
+                        "retrieved_docs": [],
+                        "raw_response": raw_response,
+                        "predicted_answer": predicted,
+                        "is_correct": is_correct,
+                    }
+
+                if "directrag" in modes:
+                    raw_response = raw_outputs_by_mode["directrag"][i]
+                    predicted = parse_answer(raw_response)
+                    docs = directrag_docs[i]
+                    is_correct = predicted.upper() == gold
+                    result["modes"]["directrag"] = {
+                        "num_queries": 1,
+                        "num_docs": len(docs),
+                        "queries": [qd["question"]],
+                        "plan": None,
+                        "retrieved_docs": _serialize_retrieved_docs_for_output(docs),
+                        "raw_response": raw_response,
+                        "predicted_answer": predicted,
+                        "is_correct": is_correct,
+                    }
+
+                if "directrewriting" in modes:
+                    raw_response = raw_outputs_by_mode["directrewriting"][i]
+                    predicted = parse_answer(raw_response)
+                    docs = directrewriting_docs[i]
+                    queries = directrewriting_queries[i]
+                    is_correct = predicted.upper() == gold
+                    result["modes"]["directrewriting"] = {
+                        "num_queries": len(queries),
+                        "num_docs": len(docs),
+                        "queries": queries,
+                        "plan": None,
+                        "retrieved_docs": _serialize_retrieved_docs_for_output(docs),
+                        "raw_response": raw_response,
+                        "predicted_answer": predicted,
+                        "is_correct": is_correct,
+                    }
+
+                results.append(result)
                 for mode in modes:
-                    stats = mode_stats[mode]
-                    if stats["total"] > 0:
-                        acc = stats["correct"] / stats["total"] * 100
-                        print(f"  {mode:12s}: {stats['correct']:3d}/{stats['total']:3d} ({acc:.1f}%)")
-                print("-" * 80)
+                    mode_result = result.get("modes", {}).get(mode, {})
+                    if "error" not in mode_result and "is_correct" in mode_result:
+                        mode_stats[mode]["total"] += 1
+                        if mode_result.get("is_correct", False):
+                            mode_stats[mode]["correct"] += 1
+        else:
+            # Estimate time based on mode complexity
+            api_calls_per_question = len([m for m in modes if m == "cot"])  # 1 for CoT
+            if "directrag" in modes:
+                api_calls_per_question += 1
+            if "directrewriting" in modes:
+                api_calls_per_question += 2  # subquery gen + answer
+
+            # Run bounded in-flight tasks (avoid creating all question coroutines at once).
+            print(f"\nProcessing {total_questions} questions with {max_concurrent} concurrent requests...")
+            print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"Estimated API calls: ~{total_questions * api_calls_per_question}")
+            print("=" * 80)
+
+            async def run_one(question_id: int) -> Dict[str, Any]:
+                question_data = dataset[question_id]
+                return await evaluate_with_timeout(question_data, question_id)
+
+            max_in_flight = max(1, int(max_concurrent))
+            question_iter = iter(question_indices)
+            in_flight: Dict[asyncio.Task, int] = {}
+
+            for _ in range(min(max_in_flight, total_questions)):
+                try:
+                    qid = next(question_iter)
+                except StopIteration:
+                    break
+                task = asyncio.create_task(run_one(qid))
+                in_flight[task] = qid
+
+            completed_count = 0
+            while in_flight:
+                done, _ = await asyncio.wait(
+                    set(in_flight.keys()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in done:
+                    _qid = in_flight.pop(task, None)
+                    try:
+                        result = task.result()
+                    except Exception as e:
+                        result = {
+                            "question_id": _qid if _qid is not None else -1,
+                            "error": f"Error: {str(e)}",
+                            "modes": {mode: {"is_correct": False, "error": str(e)} for mode in modes},
+                        }
+
+                    completed_count += 1
+                    if result is not None:
+                        results.append(result)
+                        for mode in modes:
+                            mode_result = result.get("modes", {}).get(mode, {})
+                            if "error" not in mode_result and "is_correct" in mode_result:
+                                mode_stats[mode]["total"] += 1
+                                if mode_result.get("is_correct", False):
+                                    mode_stats[mode]["correct"] += 1
+
+                    if completed_count % 50 == 0:
+                        elapsed = time.time() - start_time
+                        rate = completed_count / elapsed if elapsed > 0 else 0.0
+                        eta_seconds = (total_questions - completed_count) / rate if rate > 0 else 0.0
+                        print(
+                            f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+                            f"Progress: {completed_count}/{total_questions} "
+                            f"({completed_count/total_questions*100:.1f}%)"
+                        )
+                        print(
+                            f"  Elapsed: {elapsed/60:.1f} min | "
+                            f"Speed: {rate*60:.1f} q/min | ETA: {eta_seconds/60:.1f} min"
+                        )
+                        for mode in modes:
+                            stats = mode_stats[mode]
+                            if stats["total"] > 0:
+                                acc = stats["correct"] / stats["total"] * 100
+                                print(
+                                    f"  {mode:12s}: {stats['correct']:3d}/{stats['total']:3d} "
+                                    f"({acc:.1f}%)"
+                                )
+                        print("-" * 80)
+
+                    try:
+                        next_qid = next(question_iter)
+                    except StopIteration:
+                        next_qid = None
+                    if next_qid is not None:
+                        next_task = asyncio.create_task(run_one(next_qid))
+                        in_flight[next_task] = next_qid
     
     total_time = time.time() - start_time
     
@@ -1734,6 +2263,7 @@ async def run_evaluation_async(
         "config": {
             "llm_provider": llm_provider,
             "model_name": model_name,
+            "question_dataset": question_dataset,
             "modes": modes,
             "retriever_name": retriever_name if rag_modes else None,
             "corpus_name": corpus_name if rag_modes else None,
@@ -1750,6 +2280,9 @@ async def run_evaluation_async(
             "vllm_max_tokens": vllm_max_tokens if llm_provider == "vllm" else None,
             "vllm_max_concurrent": vllm_max_concurrent if llm_provider == "vllm" else None,
             "vllm_max_model_len": vllm_max_model_len if llm_provider == "vllm" else None,
+            "question_timeout_seconds": (
+                question_timeout_seconds if llm_provider != "vllm" else None
+            ),
             "total_docs": total_docs,
         },
         "timing": {
@@ -1805,7 +2338,10 @@ async def run_evaluation_async(
     model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("_")
     if not model_suffix:
         model_suffix = "model"
-    output_file = os.path.join(output_dir, f"medqa_{mode_suffix}_{model_suffix}_{timestamp}.json")
+    output_file = os.path.join(
+        output_dir,
+        f"{question_dataset}_{mode_suffix}_{model_suffix}_{timestamp}.json",
+    )
     
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
@@ -1987,6 +2523,7 @@ def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
         outputs = llm.chat(
             messages=messages_list,
             sampling_params=sampling,
+            use_tqdm=True,
             lora_request=lora_request,
         )
     except Exception:
@@ -1994,7 +2531,7 @@ def _run_vllm_batch_phase(model_path: str, messages_list_file: str,
             prompts,
             sampling_params=sampling,
             lora_request=lora_request,
-            use_tqdm=False,
+            use_tqdm=True,
         )
 
     # Extract text outputs
@@ -2053,6 +2590,165 @@ def _format_list(val):
     return str(val)
 
 
+def _build_cot_messages(
+    question: str,
+    options: Dict[str, str],
+) -> List[Dict[str, str]]:
+    """Build baseline CoT messages."""
+    options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
+    return [
+        {"role": "system", "content": COT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": COT_USER_PROMPT_TEMPLATE.format(
+                question=question,
+                options=options_text,
+            ),
+        },
+    ]
+
+
+def _build_directrewriting_query_messages(question: str) -> List[Dict[str, str]]:
+    """Build baseline directrewriting query-generation messages."""
+    return [
+        {"role": "system", "content": DIRECT_REWRITING_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": DIRECT_REWRITING_PROMPT.format(query=question),
+        },
+    ]
+
+
+def _build_medrag_answer_messages(
+    question: str,
+    options: Dict[str, str],
+    retrieved_docs: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Build baseline RAG answer-generation messages."""
+    context_parts = []
+    for idx, doc in enumerate(retrieved_docs[:25]):
+        title = doc.get("title", "Untitled")
+        content = doc.get("content", "")
+        context_parts.append(f"Document [{idx+1}] (Title: {title})\n{content}")
+
+    context = "\n\n".join(context_parts) if context_parts else "No documents."
+    options_text = "\n".join([f"{k}. {v}" for k, v in sorted(options.items())])
+    return [
+        {"role": "system", "content": MIRAGE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": MEDRAG_USER_PROMPT_TEMPLATE.format(
+                context=context,
+                question=question,
+                options=options_text,
+            ),
+        },
+    ]
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract first top-level JSON object from free-form text."""
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+
+    # Fast path
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Bracket matching with quote/escape handling.
+    start_idx = s.find("{")
+    while start_idx != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start_idx, len(s)):
+            ch = s[i]
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start_idx : i + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        break
+        start_idx = s.find("{", start_idx + 1)
+    return None
+
+
+def _resolve_choice_text(
+    options: Dict[str, str],
+    letter: str,
+    explicit_text: str = "",
+) -> str:
+    """Resolve option letter to `A. option text`, preferring explicit text when provided."""
+    if explicit_text and str(explicit_text).strip():
+        return str(explicit_text).strip()
+    choice = coerce_choice(letter)
+    if choice and choice in options:
+        return f"{choice}. {options.get(choice, choice)}"
+    return choice or ""
+
+
+def _enrich_plan_with_alternatives(
+    plan: Dict[str, Any],
+    raw_text: str,
+    options: Dict[str, str],
+) -> Dict[str, Any]:
+    """Backfill closest-alternative fields for v8/v11 compatibility."""
+    extra = _extract_first_json_object(raw_text) or {}
+
+    # Best guess text backfill (supports hv8 direct JSON output).
+    bg_letter = coerce_choice(plan.get("best_guess", "") or extra.get("best_guess", ""))
+    plan["best_guess"] = bg_letter
+    plan["best_guess_text"] = _resolve_choice_text(
+        options,
+        bg_letter,
+        str(plan.get("best_guess_text", "") or extra.get("best_guess_text", "")).strip(),
+    )
+
+    # Closest alternative may be emitted as either key.
+    closest_letter = coerce_choice(
+        plan.get("closest_alternative", "")
+        or plan.get("alternative_if_wrong", "")
+        or extra.get("closest_alternative", "")
+        or extra.get("alternative_if_wrong", "")
+    )
+    closest_text_raw = str(
+        plan.get("closest_alternative_text", "")
+        or extra.get("closest_alternative_text", "")
+    ).strip()
+    closest_text = _resolve_choice_text(options, closest_letter, closest_text_raw)
+
+    plan["closest_alternative"] = closest_letter
+    plan["closest_alternative_text"] = closest_text
+    # Keep legacy key aligned for older prompts/paths.
+    plan["alternative_if_wrong"] = closest_letter
+
+    return plan
+
+
 async def _run_openai_batch_phase(
     client: AsyncOpenAIClient,
     session: aiohttp.ClientSession,
@@ -2076,6 +2772,7 @@ async def run_batch_phased_evaluation_openai(
     generator_checkpoint: str = None,
     max_questions: int = 1273,
     total_docs: int = 15,
+    question_dataset: str = "medqa",
     max_tokens: int = 2048,
     max_concurrent: int = 100,
     output_dir: Optional[str] = None,
@@ -2085,6 +2782,15 @@ async def run_batch_phased_evaluation_openai(
     rewriting_prompt: str = "v1",
     generator_prompt: str = "v1",
     api_base: Optional[str] = None,
+    measure_best_guess_only: bool = False,
+    use_gating: bool = False,
+    gating_mode: str = "both",
+    gating_policy: str = "conf3_skip",
+    trust_threshold: int = 3,
+    trust_evaluator_model: Optional[str] = None,
+    trust_evaluator_prompt: str = "v1",
+    hypothesis_finalizer_prompt: str = "v1",
+    seed: int = 42,
 ) -> Dict[str, Any]:
     """
     Batch-phased hypothesis evaluation via OpenAI API (GPT-compatible).
@@ -2093,8 +2799,12 @@ async def run_batch_phased_evaluation_openai(
     instead of vLLM subprocess inference.
     """
     from training.reward import (
-        parse_queries_from_completion, parse_hypothesis_plan,
+        parse_queries_from_completion, parse_hypothesis_plan, parse_trust_evaluation,
     )
+    if seed != EVAL_FIXED_SEED:
+        print(f"INFO: overriding requested seed={seed} -> fixed seed={EVAL_FIXED_SEED}")
+    seed = EVAL_FIXED_SEED
+    set_global_seed(seed)
 
     output_dir = resolve_results_output_dir(
         output_dir=output_dir,
@@ -2110,11 +2820,17 @@ async def run_batch_phased_evaluation_openai(
     hypothesis_model = hypothesis_checkpoint or base_model
     rewriter_model = rewriter_checkpoint or base_model
     generator_model = generator_checkpoint or base_model
+    trust_eval_model = trust_evaluator_model or base_model
 
     h_prompt = HYPOTHESIS_PROMPTS[hypothesis_prompt]
     r_prompt = REWRITING_PROMPTS[rewriting_prompt]
     g_prompt = GENERATOR_PROMPTS[generator_prompt]
+    te_prompt = TRUST_EVALUATOR_PROMPTS[trust_evaluator_prompt]
+    hf_prompt = HYPOTHESIS_FINALIZER_PROMPTS[hypothesis_finalizer_prompt]
     combo_tag = f"h{hypothesis_prompt}_r{rewriting_prompt}_g{generator_prompt}"
+
+    run_self_conf_gating = use_gating and gating_mode in {"self_confidence", "both"}
+    run_trust_gating = use_gating and gating_mode in {"trust_eval", "both"}
 
     hypothesis_client = AsyncOpenAIClient(
         api_key=api_key,
@@ -2134,15 +2850,26 @@ async def run_batch_phased_evaluation_openai(
         max_concurrent=max_concurrent,
         api_base=api_base,
     )
+    trust_evaluator_client = None
+    if run_trust_gating:
+        trust_evaluator_client = AsyncOpenAIClient(
+            api_key=api_key,
+            model=trust_eval_model,
+            max_concurrent=max_concurrent,
+            api_base=api_base,
+        )
 
     os.makedirs(output_dir, exist_ok=True)
 
     # Load dataset
-    dataset = MedQADataset()
-    n = min(max_questions, len(dataset))
-    questions = [dataset[i] for i in range(n)]
+    dataset = MedQADataset(question_dataset=question_dataset)
+    capped_total = max(0, min(max_questions, len(dataset)))
+    question_ids = list(range(capped_total))
+    questions = [dataset[i] for i in question_ids]
+    n = len(questions)
     print(f"\n{'='*70}")
     print(f"Batch-Phased Evaluation (OpenAI): {n} questions")
+    print(f"Question set: {question_dataset}")
     print(f"Combo:        {combo_tag}")
     print(f"  hypothesis: {h_prompt['description']}")
     print(f"  rewriting:  {r_prompt['description']}")
@@ -2155,9 +2882,39 @@ async def run_batch_phased_evaluation_openai(
     print(f"Generator:    {generator_model}"
           f"{' (checkpoint override)' if generator_checkpoint else ''}")
     print(f"max_concurrent={max_concurrent}  max_tokens={max_tokens}")
+    print(f"seed={seed}")
+    print(f"temperature={EVAL_FIXED_TEMPERATURE}")
+    print(f"do_sample={EVAL_FIXED_DO_SAMPLE} (where supported)")
+    if measure_best_guess_only:
+        print("best_guess_only=True (planner phase only)")
+    if use_gating:
+        print(f"use_gating=True  gating_mode={gating_mode}")
+        if run_self_conf_gating:
+            print(f"  self_confidence policy={gating_policy}")
+        if run_trust_gating:
+            print(
+                f"  trust_eval threshold={trust_threshold} "
+                f"model={trust_eval_model} prompt={trust_evaluator_prompt} "
+                f"finalizer_prompt={hypothesis_finalizer_prompt}"
+            )
     if api_base:
         print(f"api_base={api_base}")
     print(f"{'='*70}")
+
+    valid_gating_modes = {"self_confidence", "trust_eval", "both"}
+    if gating_mode not in valid_gating_modes:
+        raise ValueError(
+            f"Unknown gating mode '{gating_mode}'. "
+            f"Choose from: {sorted(valid_gating_modes)}"
+        )
+    valid_gating_policies = {"conf3_skip", "conf23_skip", "conf3_only_retrieve"}
+    if run_self_conf_gating and gating_policy not in valid_gating_policies:
+        raise ValueError(
+            f"Unknown gating policy '{gating_policy}'. "
+            f"Choose from: {sorted(valid_gating_policies)}"
+        )
+    if trust_threshold not in (1, 2, 3):
+        raise ValueError("--trust-threshold must be one of {1,2,3}.")
 
     t_total = time.time()
 
@@ -2201,13 +2958,226 @@ async def run_batch_phased_evaluation_openai(
             p.setdefault("reasoning", "")
             p.setdefault("confirming_evidence", [])
             p.setdefault("alternative_if_wrong", "")
+            p.setdefault("closest_alternative", "")
+            p.setdefault("closest_alternative_text", "")
+            p["confidence_level"] = coerce_confidence_level(
+                p.get("confidence_level", 2),
+                default=2,
+            )
             if not p["discriminating_features"]:
                 words = re.findall(r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
                 p["discriminating_features"] = words[:3] or ["symptom"]
+            p = _enrich_plan_with_alternatives(
+                p,
+                text,
+                questions[idx].get("options", {}),
+            )
             plans.append(p)
 
         print(f"  ✓ Phase 1 done: {len(plans)} hypotheses "
               f"in {time.time()-t1:.1f}s")
+
+        # ── Planner diagnostics: best_guess accuracy + confidence distribution ──
+        best_guess_correct = 0
+        closest_alternative_correct = 0
+        closest_alternative_rescue = 0
+        confidence_counts = {1: 0, 2: 0, 3: 0}
+        planner_rows = []
+        for i, qd in enumerate(questions):
+            gold = coerce_choice(qd.get("answer_idx", qd.get("answer", "")))
+            best_guess = coerce_choice(plans[i].get("best_guess", ""))
+            closest_alternative = coerce_choice(
+                plans[i].get("closest_alternative", plans[i].get("alternative_if_wrong", ""))
+            )
+            confidence = coerce_confidence_level(plans[i].get("confidence_level", 2), default=2)
+            confidence_counts[confidence] += 1
+            best_guess_is_correct = (best_guess == gold and bool(gold))
+            closest_alt_is_correct = (closest_alternative == gold and bool(gold))
+            if best_guess_is_correct:
+                best_guess_correct += 1
+            if closest_alt_is_correct:
+                closest_alternative_correct += 1
+                if not best_guess_is_correct:
+                    closest_alternative_rescue += 1
+            planner_rows.append({
+                "question_id": question_ids[i],
+                "gold": gold,
+                "best_guess": best_guess,
+                "best_guess_text": plans[i].get("best_guess_text", ""),
+                "closest_alternative": closest_alternative,
+                "closest_alternative_text": plans[i].get("closest_alternative_text", ""),
+                "confidence_level": confidence,
+                "best_guess_correct": best_guess_is_correct,
+                "closest_alternative_correct": closest_alt_is_correct,
+                "top2_hit": (best_guess_is_correct or closest_alt_is_correct),
+            })
+
+        best_guess_accuracy = (best_guess_correct / n * 100) if n > 0 else 0.0
+        closest_alternative_accuracy = (closest_alternative_correct / n * 100) if n > 0 else 0.0
+        top2_accuracy = (
+            (best_guess_correct + closest_alternative_rescue) / n * 100 if n > 0 else 0.0
+        )
+        print(
+            f"  ✓ best_guess accuracy: {best_guess_accuracy:.2f}% "
+            f"({best_guess_correct}/{n})"
+        )
+        print(
+            f"  ✓ closest_alternative accuracy: {closest_alternative_accuracy:.2f}% "
+            f"({closest_alternative_correct}/{n}) | "
+            f"top2={top2_accuracy:.2f}% (rescue={closest_alternative_rescue})"
+        )
+        print(
+            "  ✓ confidence distribution: "
+            f"L1={confidence_counts[1]} ({confidence_counts[1]/n*100:.1f}%), "
+            f"L2={confidence_counts[2]} ({confidence_counts[2]/n*100:.1f}%), "
+            f"L3={confidence_counts[3]} ({confidence_counts[3]/n*100:.1f}%)"
+        )
+
+        trust_levels = [2] * n
+        trust_reasons = [""] * n
+        trust_flags = [[] for _ in range(n)]
+        trust_counts = {1: 0, 2: 0, 3: 0}
+        if run_trust_gating:
+            print(
+                f"\n[Phase 1.5/4] Evaluating hypothesis trust for {n} questions "
+                f"({trust_eval_model}) ..."
+            )
+            t15 = time.time()
+            trust_messages = []
+            for i, qd in enumerate(questions):
+                options_text = "\n".join(
+                    [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+                )
+                hypothesis_json = json.dumps(plans[i], ensure_ascii=False)
+                trust_messages.append([
+                    {"role": "system", "content": te_prompt["system"]},
+                    {
+                        "role": "user",
+                        "content": te_prompt["user"].format(
+                            question=qd["question"],
+                            options=options_text,
+                            hypothesis_json=hypothesis_json,
+                        ),
+                    },
+                ])
+
+            trust_texts = await _run_openai_batch_phase(
+                trust_evaluator_client,  # type: ignore[arg-type]
+                session,
+                trust_messages,
+                desc="Phase1.5-TrustEval",
+            )
+
+            for i, text in enumerate(trust_texts):
+                parsed = parse_trust_evaluation(text)
+                level = coerce_confidence_level(
+                    parsed.get("hypothesis_trust", 2),
+                    default=2,
+                )
+                trust_levels[i] = level
+                trust_reasons[i] = str(parsed.get("trust_reason", "") or "")
+                trust_flags[i] = parsed.get("risk_flags", []) or []
+                trust_counts[level] += 1
+
+            print(
+                "  ✓ trust distribution: "
+                f"L1={trust_counts[1]} ({trust_counts[1]/n*100:.1f}%), "
+                f"L2={trust_counts[2]} ({trust_counts[2]/n*100:.1f}%), "
+                f"L3={trust_counts[3]} ({trust_counts[3]/n*100:.1f}%)"
+            )
+            print(f"  ✓ Phase 1.5 done in {time.time()-t15:.1f}s")
+
+        if measure_best_guess_only:
+            elapsed = time.time() - t_total
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", base_model).strip("_") or "model"
+            mode_tag = f"bestguess_h{hypothesis_prompt}"
+            out_json = os.path.join(
+                output_dir,
+                f"{question_dataset}_{mode_tag}_{model_suffix}_{ts}.json",
+            )
+            out_jsonl = os.path.join(
+                output_dir,
+                f"{question_dataset}_{mode_tag}_{model_suffix}_{ts}.jsonl",
+            )
+            out_csv = os.path.join(
+                output_dir,
+                f"{question_dataset}_{mode_tag}_{model_suffix}_{ts}.csv",
+            )
+
+            summary = {
+                "config": {
+                    "llm_provider": "openai",
+                    "base_model": base_model,
+                    "hypothesis_prompt": hypothesis_prompt,
+                    "question_dataset": question_dataset,
+                    "total_evaluated": n,
+                    "measure_best_guess_only": True,
+                    "seed": seed,
+                    "command": " ".join(sys.argv),
+                    "api_base": api_base,
+                },
+                "timing": {
+                    "total_seconds": elapsed,
+                    "avg_per_question": elapsed / n if n else 0,
+                },
+                "planner_results": {
+                    "best_guess_accuracy": best_guess_accuracy,
+                    "best_guess_correct": best_guess_correct,
+                    "best_guess_total": n,
+                    "closest_alternative_accuracy": closest_alternative_accuracy,
+                    "closest_alternative_correct": closest_alternative_correct,
+                    "closest_alternative_rescue": closest_alternative_rescue,
+                    "top2_accuracy": top2_accuracy,
+                    "confidence_counts": confidence_counts,
+                    "confidence_ratios": {
+                        "1": confidence_counts[1] / n if n else 0.0,
+                        "2": confidence_counts[2] / n if n else 0.0,
+                        "3": confidence_counts[3] / n if n else 0.0,
+                    },
+                    "trust_counts": trust_counts,
+                    "trust_ratios": {
+                        "1": trust_counts[1] / n if n else 0.0,
+                        "2": trust_counts[2] / n if n else 0.0,
+                        "3": trust_counts[3] / n if n else 0.0,
+                    },
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump({"summary": summary, "results": planner_rows}, f, indent=2, ensure_ascii=False)
+            _write_jsonl(out_jsonl, planner_rows)
+            _write_summary_csv(out_csv, {
+                "mode": mode_tag,
+                "model": base_model,
+                "hypothesis_prompt": hypothesis_prompt,
+                "best_guess_accuracy": round(best_guess_accuracy, 4),
+                "best_guess_correct": best_guess_correct,
+                "best_guess_total": n,
+                "closest_alternative_accuracy": round(closest_alternative_accuracy, 4),
+                "closest_alternative_correct": closest_alternative_correct,
+                "closest_alternative_rescue": closest_alternative_rescue,
+                "top2_accuracy": round(top2_accuracy, 4),
+                "conf_1_ratio": round(confidence_counts[1] / n if n else 0.0, 6),
+                "conf_2_ratio": round(confidence_counts[2] / n if n else 0.0, 6),
+                "conf_3_ratio": round(confidence_counts[3] / n if n else 0.0, 6),
+                "trust_1_ratio": round(trust_counts[1] / n if n else 0.0, 6),
+                "trust_2_ratio": round(trust_counts[2] / n if n else 0.0, 6),
+                "trust_3_ratio": round(trust_counts[3] / n if n else 0.0, 6),
+                "seed": seed,
+                "command": " ".join(sys.argv),
+            })
+            print(f"✓ Saved planner summary: {out_json}")
+            print(f"✓ Saved planner details jsonl: {out_jsonl}")
+            print(f"✓ Saved planner summary csv: {out_csv}")
+            return {
+                "combo": mode_tag,
+                "accuracy": best_guess_accuracy,
+                "correct": best_guess_correct,
+                "total": n,
+                "file": out_json,
+            }
 
         # ── Phase 2: Rewrite ALL (OpenAI async) ──
         print(f"\n[Phase 2/4] Generating queries for {n} questions "
@@ -2225,10 +3195,16 @@ async def run_batch_phased_evaluation_openai(
                 f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}"
                 if bg_letter in qd.get("options", {}) else bg_letter
             )
-            alt_letter = (p.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
-            alt_text = (
+            alt_letter = (
+                p.get("closest_alternative", "")
+                or p.get("alternative_if_wrong", "")
+                or ""
+            ).strip().upper().rstrip(".")
+            closest_alternative_text = p.get("closest_alternative_text") or ""
+            alt_text = closest_alternative_text or (
                 f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}"
-                if alt_letter in qd.get("options", {}) else alt_letter
+                if alt_letter in qd.get("options", {})
+                else alt_letter
             )
             user = r_prompt["user"].format(
                 question=qd["question"],
@@ -2240,6 +3216,8 @@ async def run_batch_phased_evaluation_openai(
                 discriminating_features=_format_list(p.get("discriminating_features", [])),
                 alternative_if_wrong=p.get("alternative_if_wrong", ""),
                 alternative_text=alt_text,
+                closest_alternative=p.get("closest_alternative", ""),
+                closest_alternative_text=alt_text,
             )
             rw_messages.append([
                 {"role": "system", "content": r_prompt["system"]},
@@ -2320,6 +3298,23 @@ async def run_batch_phased_evaluation_openai(
             if (i + 1) % 200 == 0:
                 print(f"  ... {i+1}/{n} retrieved")
 
+        simple_rag_docs = None
+        if use_gating:
+            print(f"\n[Phase 3b/4] Retrieving SIMPLE-RAG documents for {n} questions ...")
+            t3b = time.time()
+            simple_rag_docs = []
+            for i, qd in enumerate(questions):
+                simple_rag_docs.append(
+                    _retrieve_fused_docs_for_query_set(
+                        retriever,
+                        [qd["question"]],
+                        total_docs,
+                    )
+                )
+                if (i + 1) % 200 == 0:
+                    print(f"  ... {i+1}/{n} simple-rag retrieved")
+            print(f"  ✓ Phase 3b done: simple-rag retrieval in {time.time()-t3b:.1f}s")
+
         print(f"  ✓ Phase 3 done: retrieval in {time.time()-t3:.1f}s")
 
         # Free retriever memory before phase 4
@@ -2357,15 +3352,42 @@ async def run_batch_phased_evaluation_openai(
                 "context": ctx,
                 "question": qd["question"],
                 "options": options_text,
+                "hypothesis_summary": "",
+                "queries_summary": "",
+                "best_guess": "",
+                "best_guess_text": "",
+                "closest_alternative": "",
+                "closest_alternative_text": "",
             }
-            if generator_prompt == "v2":
+            if generator_prompt in {"v2", "v3"}:
                 p = plans[i]
+                bg_letter = (p.get("best_guess", "") or "").strip().upper().rstrip(".")
+                bg_text = p.get("best_guess_text") or (
+                    f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}"
+                    if bg_letter in qd.get("options", {})
+                    else bg_letter
+                )
+                alt_letter = (
+                    p.get("closest_alternative", "")
+                    or p.get("alternative_if_wrong", "")
+                    or ""
+                ).strip().upper().rstrip(".")
+                closest_alternative_text = p.get("closest_alternative_text") or ""
+                alt_text = closest_alternative_text or (
+                    f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}"
+                    if alt_letter in qd.get("options", {})
+                    else alt_letter
+                )
                 fmt_vars["hypothesis_summary"] = (
                     f"Best guess: {p.get('best_guess', '')} — {p.get('reasoning', '')}"
                 )
                 fmt_vars["queries_summary"] = "\n".join(
                     f"  {j+1}. {q}" for j, q in enumerate(all_queries[i])
                 )
+                fmt_vars["best_guess"] = p.get("best_guess", "")
+                fmt_vars["best_guess_text"] = bg_text
+                fmt_vars["closest_alternative"] = p.get("closest_alternative", "")
+                fmt_vars["closest_alternative_text"] = alt_text
 
             user = g_prompt["user"].format(**fmt_vars)
             ans_messages.append([
@@ -2380,41 +3402,319 @@ async def run_batch_phased_evaluation_openai(
             desc="Phase4-Generator",
         )
 
+        no_rag_texts = None
+        simple_rag_texts = None
+        trust_finalizer_text_by_idx: Dict[int, str] = {}
+        if use_gating:
+            print(f"\n[Phase 4b/4] Generating No-RAG answers for {n} questions ...")
+            t4b = time.time()
+            no_rag_messages = []
+            for qd in questions:
+                options_text = "\n".join(
+                    [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+                )
+                no_rag_messages.append([
+                    {"role": "system", "content": COT_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": COT_USER_PROMPT_TEMPLATE.format(
+                            question=qd["question"],
+                            options=options_text,
+                        ),
+                    },
+                ])
+            no_rag_texts = await _run_openai_batch_phase(
+                generator_client,
+                session,
+                no_rag_messages,
+                desc="Phase4b-NoRAG",
+            )
+            print(f"  ✓ Phase 4b done: no-rag answers in {time.time()-t4b:.1f}s")
+
+            print(f"\n[Phase 4c/4] Generating SIMPLE-RAG answers for {n} questions ...")
+            t4c = time.time()
+            simple_messages = []
+            for i, qd in enumerate(questions):
+                options_text = "\n".join(
+                    [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+                )
+                docs = (simple_rag_docs or [])[i] if simple_rag_docs is not None else []
+                ctx = "\n\n".join(
+                    [
+                        f"Document [{j+1}] (Title: {d.get('title', 'Untitled')})\n"
+                        f"{d.get('content', '')}"
+                        for j, d in enumerate(docs[:25])
+                    ]
+                ) or "No documents."
+                fmt_vars = {
+                    "context": ctx,
+                    "question": qd["question"],
+                    "options": options_text,
+                    "hypothesis_summary": "",
+                    "queries_summary": "",
+                    "best_guess": "",
+                    "best_guess_text": "",
+                    "closest_alternative": "",
+                    "closest_alternative_text": "",
+                }
+                simple_user = g_prompt["user"].format(**fmt_vars)
+                simple_messages.append([
+                    {"role": "system", "content": g_prompt["system"]},
+                    {"role": "user", "content": simple_user},
+                ])
+            simple_rag_texts = await _run_openai_batch_phase(
+                generator_client,
+                session,
+                simple_messages,
+                desc="Phase4c-SimpleRAG",
+            )
+            print(f"  ✓ Phase 4c done: simple-rag answers in {time.time()-t4c:.1f}s")
+
+            if run_trust_gating:
+                high_trust_indices = [
+                    i for i, level in enumerate(trust_levels)
+                    if is_high_trust(level, trust_threshold)
+                ]
+                if high_trust_indices:
+                    print(
+                        f"\n[Phase 4d/4] Generating hypothesis-finalizer answers for "
+                        f"{len(high_trust_indices)} high-trust questions ..."
+                    )
+                    t4d = time.time()
+                    finalizer_messages = []
+                    for i in high_trust_indices:
+                        qd = questions[i]
+                        options_text = "\n".join(
+                            [f"{k}. {v}" for k, v in sorted(qd["options"].items())]
+                        )
+                        finalizer_messages.append([
+                            {"role": "system", "content": hf_prompt["system"]},
+                            {
+                                "role": "user",
+                                "content": hf_prompt["user"].format(
+                                    question=qd["question"],
+                                    options=options_text,
+                                    hypothesis_json=json.dumps(plans[i], ensure_ascii=False),
+                                ),
+                            },
+                        ])
+
+                    finalizer_texts = await _run_openai_batch_phase(
+                        generator_client,
+                        session,
+                        finalizer_messages,
+                        desc="Phase4d-HypothesisFinalizer",
+                    )
+                    for idx, text in zip(high_trust_indices, finalizer_texts):
+                        trust_finalizer_text_by_idx[idx] = text
+                    print(
+                        f"  ✓ Phase 4d done: hypothesis-finalizer answers "
+                        f"in {time.time()-t4d:.1f}s"
+                    )
+                else:
+                    print("\n[Phase 4d/4] No high-trust samples, skipped finalizer phase.")
+
         print(f"  ✓ Phase 4 done: answers in {time.time()-t4:.1f}s")
 
     # ── Compile Results ──
     print(f"\n[Result] Compiling ...")
     results = []
-    correct = 0
-    total = 0
+    detail_rows = []
+    hcqr_correct = 0
+    no_rag_correct = 0
+    simple_rag_correct = 0
+    self_conf_gating_correct = 0
+    trust_gating_correct = 0
+    closest_alternative_correct = 0
+    closest_alternative_rescue = 0
+    total = n
+    self_conf_retrieval_used_count = 0
+    trust_retrieval_used_count = 0
+
     for i, qd in enumerate(questions):
         correct_answer = qd.get("answer_idx", qd.get("answer", ""))
+        gold = coerce_choice(correct_answer)
+        plan = plans[i]
+        confidence_level = coerce_confidence_level(plan.get("confidence_level", 2), default=2)
+        trust_level = coerce_confidence_level(
+            trust_levels[i] if i < len(trust_levels) else 2,
+            default=2,
+        )
+        trust_high = is_high_trust(trust_level, trust_threshold)
+        best_guess = coerce_choice(plan.get("best_guess", ""))
+        best_guess_is_correct = (best_guess == gold and bool(gold))
+        closest_alternative = coerce_choice(
+            plan.get("closest_alternative", plan.get("alternative_if_wrong", ""))
+        )
+        closest_alternative_is_correct = (closest_alternative == gold and bool(gold))
+        if closest_alternative_is_correct:
+            closest_alternative_correct += 1
+            if not best_guess_is_correct:
+                closest_alternative_rescue += 1
+
         raw_resp = ans_texts[i]
-        predicted = parse_answer(raw_resp)
-        is_correct = predicted.upper() == correct_answer.upper()
-        if is_correct:
-            correct += 1
-        total += 1
+        predicted_hcqr = parse_answer(raw_resp)
+        hcqr_is_correct = predicted_hcqr.upper() == gold.upper()
+        if hcqr_is_correct:
+            hcqr_correct += 1
+
+        predicted_no_rag = ""
+        no_rag_is_correct = False
+        predicted_simple_rag = ""
+        simple_rag_is_correct = False
+        retrieve_for_self_conf = True
+        pred_self_conf_gate = predicted_hcqr
+        self_conf_gate_correct = hcqr_is_correct
+        retrieve_for_trust = True
+        pred_trust_gate = predicted_hcqr
+        trust_gate_correct = hcqr_is_correct
+
+        if use_gating:
+            predicted_no_rag = parse_answer((no_rag_texts or [""])[i])
+            no_rag_is_correct = predicted_no_rag.upper() == gold.upper()
+            if no_rag_is_correct:
+                no_rag_correct += 1
+
+            predicted_simple_rag = parse_answer((simple_rag_texts or [""])[i])
+            simple_rag_is_correct = predicted_simple_rag.upper() == gold.upper()
+            if simple_rag_is_correct:
+                simple_rag_correct += 1
+
+            if run_self_conf_gating:
+                retrieve_for_self_conf = should_use_retrieval(confidence_level, gating_policy)
+                if retrieve_for_self_conf:
+                    self_conf_retrieval_used_count += 1
+                    pred_self_conf_gate = predicted_hcqr
+                    self_conf_gate_correct = hcqr_is_correct
+                else:
+                    pred_self_conf_gate = predicted_no_rag
+                    self_conf_gate_correct = no_rag_is_correct
+                if self_conf_gate_correct:
+                    self_conf_gating_correct += 1
+
+            if run_trust_gating:
+                retrieve_for_trust = not trust_high
+                if retrieve_for_trust:
+                    trust_retrieval_used_count += 1
+                    pred_trust_gate = predicted_hcqr
+                    trust_gate_correct = hcqr_is_correct
+                else:
+                    pred_trust_gate = parse_answer(trust_finalizer_text_by_idx.get(i, ""))
+                    trust_gate_correct = pred_trust_gate.upper() == gold.upper()
+                if trust_gate_correct:
+                    trust_gating_correct += 1
+
+        hcqr_docs_for_output = _serialize_retrieved_docs_for_output(all_docs[i])
         results.append({
-            "question_id": i,
+            "question_id": question_ids[i],
             "question": qd["question"],
             "options": qd["options"],
-            "correct_answer": correct_answer,
+            "correct_answer": gold,
             "modes": {
                 combo_tag: {
                     "num_queries": len(all_queries[i]),
                     "num_docs": len(all_docs[i]),
                     "queries": all_queries[i],
-                    "plan": plans[i],
+                    "plan": plan,
+                    "retrieved_docs": hcqr_docs_for_output,
                     "raw_response": raw_resp,
-                    "predicted_answer": predicted,
-                    "is_correct": is_correct,
+                    "predicted_answer": predicted_hcqr,
+                    "is_correct": hcqr_is_correct,
                 }
             },
+            "planner": {
+                "best_guess": best_guess,
+                "best_guess_text": plan.get("best_guess_text", ""),
+                "closest_alternative": closest_alternative,
+                "closest_alternative_text": plan.get("closest_alternative_text", ""),
+                "best_guess_is_correct": best_guess_is_correct,
+                "closest_alternative_is_correct": closest_alternative_is_correct,
+                "top2_hit": (best_guess_is_correct or closest_alternative_is_correct),
+                "confidence_level": confidence_level,
+                "trust_level": trust_level if run_trust_gating else None,
+                "trust_reason": trust_reasons[i] if run_trust_gating else "",
+                "risk_flags": trust_flags[i] if run_trust_gating else [],
+            }
+        })
+        if use_gating:
+            results[-1]["modes"]["no_rag"] = {
+                "predicted_answer": predicted_no_rag,
+                "is_correct": no_rag_is_correct,
+            }
+            results[-1]["modes"]["simple_rag"] = {
+                "num_queries": 1,
+                "num_docs": len((simple_rag_docs or [])[i]) if simple_rag_docs is not None else 0,
+                "queries": [qd["question"]],
+                "retrieved_docs": _serialize_retrieved_docs_for_output(
+                    (simple_rag_docs or [])[i] if simple_rag_docs is not None else []
+                ),
+                "raw_response": (simple_rag_texts or [""])[i] if simple_rag_texts is not None else "",
+                "predicted_answer": predicted_simple_rag,
+                "is_correct": simple_rag_is_correct,
+            }
+            if run_self_conf_gating:
+                results[-1]["modes"]["self_confidence_gating"] = {
+                    "policy": gating_policy,
+                    "retrieval_used": retrieve_for_self_conf,
+                    "predicted_answer": pred_self_conf_gate,
+                    "is_correct": self_conf_gate_correct,
+                }
+            if run_trust_gating:
+                results[-1]["modes"]["trust_gating"] = {
+                    "threshold": trust_threshold,
+                    "trust_level": trust_level,
+                    "trust_high": trust_high,
+                    "retrieval_used": retrieve_for_trust,
+                    "predicted_answer": pred_trust_gate,
+                    "is_correct": trust_gate_correct,
+                }
+        detail_rows.append({
+            "question_id": question_ids[i],
+            "gold": gold,
+            "best_guess": best_guess,
+            "best_guess_correct": best_guess_is_correct,
+            "closest_alternative": closest_alternative,
+            "closest_alternative_correct": closest_alternative_is_correct,
+            "top2_hit": (best_guess_is_correct or closest_alternative_is_correct),
+            "confidence_level": confidence_level,
+            "trust_level": trust_level if run_trust_gating else None,
+            "trust_high": trust_high if run_trust_gating else None,
+            "pred_hcqr": predicted_hcqr,
+            "hcqr_correct": hcqr_is_correct,
+            "pred_no_rag": predicted_no_rag,
+            "no_rag_correct": no_rag_is_correct,
+            "pred_simple_rag": predicted_simple_rag,
+            "simple_rag_correct": simple_rag_is_correct,
+            "retrieve_for_self_conf": bool(retrieve_for_self_conf) if run_self_conf_gating else None,
+            "pred_self_conf_gate": pred_self_conf_gate if run_self_conf_gating else "",
+            "self_conf_gate_correct": self_conf_gate_correct if run_self_conf_gating else None,
+            "retrieve_for_trust": bool(retrieve_for_trust) if run_trust_gating else None,
+            "pred_trust_gate": pred_trust_gate if run_trust_gating else "",
+            "trust_gate_correct": trust_gate_correct if run_trust_gating else None,
         })
 
     elapsed = time.time() - t_total
-    accuracy = correct / total * 100 if total > 0 else 0
+    hcqr_accuracy = hcqr_correct / total * 100 if total > 0 else 0
+    no_rag_accuracy = no_rag_correct / total * 100 if total > 0 else 0
+    simple_rag_accuracy = simple_rag_correct / total * 100 if total > 0 else 0
+    self_conf_gating_accuracy = (
+        self_conf_gating_correct / total * 100 if total > 0 else 0
+    )
+    trust_gating_accuracy = (
+        trust_gating_correct / total * 100 if total > 0 else 0
+    )
+    closest_alternative_accuracy = (
+        closest_alternative_correct / total * 100 if total > 0 else 0
+    )
+    top2_accuracy = (
+        (best_guess_correct + closest_alternative_rescue) / total * 100 if total > 0 else 0
+    )
+    self_conf_retrieval_usage_ratio = (
+        self_conf_retrieval_used_count / total if total > 0 else 0.0
+    )
+    trust_retrieval_usage_ratio = (
+        trust_retrieval_used_count / total if total > 0 else 0.0
+    )
 
     summary = {
         "config": {
@@ -2426,49 +3726,205 @@ async def run_batch_phased_evaluation_openai(
             "hypothesis_prompt": hypothesis_prompt,
             "rewriting_prompt": rewriting_prompt,
             "generator_prompt": generator_prompt,
+            "question_dataset": question_dataset,
             "combo_tag": combo_tag,
             "total_evaluated": total,
             "total_docs": total_docs,
             "max_tokens": max_tokens,
             "max_concurrent": max_concurrent,
             "api_base": api_base,
+            "seed": seed,
+            "command": " ".join(sys.argv),
+            "measure_best_guess_only": measure_best_guess_only,
+            "use_gating": use_gating,
+            "gating_mode": gating_mode if use_gating else None,
+            "gating_policy": gating_policy if run_self_conf_gating else None,
+            "trust_threshold": trust_threshold if run_trust_gating else None,
+            "trust_evaluator_model": trust_eval_model if run_trust_gating else None,
+            "trust_evaluator_prompt": trust_evaluator_prompt if run_trust_gating else None,
+            "hypothesis_finalizer_prompt": (
+                hypothesis_finalizer_prompt if run_trust_gating else None
+            ),
         },
         "timing": {
             "total_seconds": elapsed,
             "avg_per_question": elapsed / total if total else 0,
             "questions_per_minute": total / elapsed * 60 if elapsed > 0 else 0,
         },
+        "planner_results": {
+            "best_guess_accuracy": best_guess_accuracy,
+            "best_guess_correct": best_guess_correct,
+            "best_guess_total": total,
+            "closest_alternative_accuracy": closest_alternative_accuracy,
+            "closest_alternative_correct": closest_alternative_correct,
+            "closest_alternative_rescue": closest_alternative_rescue,
+            "top2_accuracy": top2_accuracy,
+            "confidence_counts": confidence_counts,
+            "confidence_ratios": {
+                "1": confidence_counts[1] / total if total else 0.0,
+                "2": confidence_counts[2] / total if total else 0.0,
+                "3": confidence_counts[3] / total if total else 0.0,
+            },
+            "trust_counts": trust_counts,
+            "trust_ratios": {
+                "1": trust_counts[1] / total if total else 0.0,
+                "2": trust_counts[2] / total if total else 0.0,
+                "3": trust_counts[3] / total if total else 0.0,
+            },
+        },
         "mode_results": {
             combo_tag: {
-                "correct": correct,
+                "correct": hcqr_correct,
                 "total": total,
-                "accuracy": accuracy,
+                "accuracy": hcqr_accuracy,
             }
         },
         "timestamp": datetime.now().isoformat(),
     }
+    if use_gating:
+        summary["mode_results"].update({
+            "no_rag": {
+                "correct": no_rag_correct,
+                "total": total,
+                "accuracy": no_rag_accuracy,
+            },
+            "simple_rag": {
+                "correct": simple_rag_correct,
+                "total": total,
+                "accuracy": simple_rag_accuracy,
+            },
+        })
+        if run_self_conf_gating:
+            summary["mode_results"]["self_confidence_gating"] = {
+                "policy": gating_policy,
+                "correct": self_conf_gating_correct,
+                "total": total,
+                "accuracy": self_conf_gating_accuracy,
+                "retrieval_used_count": self_conf_retrieval_used_count,
+                "retrieval_usage_ratio": self_conf_retrieval_usage_ratio,
+            }
+            # Backward-compatible alias for prior scripts.
+            summary["mode_results"]["gating"] = summary["mode_results"]["self_confidence_gating"]
+        if run_trust_gating:
+            summary["mode_results"]["trust_gating"] = {
+                "threshold": trust_threshold,
+                "correct": trust_gating_correct,
+                "total": total,
+                "accuracy": trust_gating_accuracy,
+                "retrieval_used_count": trust_retrieval_used_count,
+                "retrieval_usage_ratio": trust_retrieval_usage_ratio,
+            }
 
     print(f"\n{'='*70}")
-    print(f"[{combo_tag}] {accuracy:.2f}% ({correct}/{total}) "
-          f"in {elapsed:.0f}s ({summary['timing']['questions_per_minute']:.1f} q/min)")
+    print(
+        f"[HCQR:{combo_tag}] {hcqr_accuracy:.2f}% ({hcqr_correct}/{total}) "
+        f"in {elapsed:.0f}s ({summary['timing']['questions_per_minute']:.1f} q/min)"
+    )
+    print(
+        f"best_guess={best_guess_accuracy:.2f}% | "
+        f"closest_alt={closest_alternative_accuracy:.2f}% | "
+        f"top2={top2_accuracy:.2f}% | "
+        f"conf(L1/L2/L3)=({confidence_counts[1]}/{confidence_counts[2]}/{confidence_counts[3]})"
+    )
+    if run_trust_gating:
+        print(
+            f"trust(L1/L2/L3)=({trust_counts[1]}/{trust_counts[2]}/{trust_counts[3]})"
+        )
+    if run_self_conf_gating:
+        print(
+            f"self_conf_gating({gating_policy})={self_conf_gating_accuracy:.2f}% | "
+            f"no_rag={no_rag_accuracy:.2f}% | "
+            f"simple_rag={simple_rag_accuracy:.2f}% | "
+            f"retrieval_usage={self_conf_retrieval_usage_ratio*100:.1f}%"
+        )
+    if run_trust_gating:
+        print(
+            f"trust_gating(th={trust_threshold})={trust_gating_accuracy:.2f}% | "
+            f"retrieval_usage={trust_retrieval_usage_ratio*100:.1f}%"
+        )
     print(f"{'='*70}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_suffix = re.sub(r"[^A-Za-z0-9._-]+", "_", base_model).strip("_")
     if not model_suffix:
         model_suffix = "model"
+    run_tag = combo_tag
+    if use_gating:
+        run_tag = f"{combo_tag}_gating_{gating_mode}"
+        if run_self_conf_gating:
+            run_tag = f"{run_tag}_{gating_policy}"
+        if run_trust_gating:
+            run_tag = f"{run_tag}_trust{trust_threshold}"
     out_file = os.path.join(
         output_dir,
-        f"medqa_{combo_tag}_{model_suffix}_{ts}.json",
+        f"{question_dataset}_{run_tag}_{model_suffix}_{ts}.json",
     )
-    with open(out_file, "w") as f:
+    with open(out_file, "w", encoding="utf-8") as f:
         json.dump({"summary": summary, "results": results}, f, indent=2, ensure_ascii=False)
+
+    out_jsonl = os.path.join(
+        output_dir,
+        f"{question_dataset}_{run_tag}_{model_suffix}_{ts}.jsonl",
+    )
+    out_csv = os.path.join(
+        output_dir,
+        f"{question_dataset}_{run_tag}_{model_suffix}_{ts}.csv",
+    )
+    _write_jsonl(out_jsonl, detail_rows)
+    summary_csv_row = {
+        "run_tag": run_tag,
+        "model": base_model,
+        "question_dataset": question_dataset,
+        "hypothesis_prompt": hypothesis_prompt,
+        "rewriting_prompt": rewriting_prompt,
+        "generator_prompt": generator_prompt,
+        "best_guess_accuracy": round(best_guess_accuracy, 4),
+        "closest_alternative_accuracy": round(closest_alternative_accuracy, 4),
+        "top2_accuracy": round(top2_accuracy, 4),
+        "conf_1_ratio": round(confidence_counts[1] / total if total else 0.0, 6),
+        "conf_2_ratio": round(confidence_counts[2] / total if total else 0.0, 6),
+        "conf_3_ratio": round(confidence_counts[3] / total if total else 0.0, 6),
+        "acc_hcqr": round(hcqr_accuracy, 4),
+        "acc_no_rag": round(no_rag_accuracy, 4),
+        "acc_simple_rag": round(simple_rag_accuracy, 4),
+        "acc_self_conf_gating": round(self_conf_gating_accuracy if run_self_conf_gating else hcqr_accuracy, 4),
+        "acc_trust_gating": round(trust_gating_accuracy if run_trust_gating else hcqr_accuracy, 4),
+        "gating_mode": gating_mode if use_gating else "disabled",
+        "gating_policy": gating_policy if run_self_conf_gating else "",
+        "trust_threshold": trust_threshold if run_trust_gating else "",
+        "trust_eval_model": trust_eval_model if run_trust_gating else "",
+        "trust_prompt": trust_evaluator_prompt if run_trust_gating else "",
+        "finalizer_prompt": hypothesis_finalizer_prompt if run_trust_gating else "",
+        "retrieval_usage_self_conf": round(self_conf_retrieval_usage_ratio if run_self_conf_gating else 1.0, 6),
+        "retrieval_usage_trust": round(trust_retrieval_usage_ratio if run_trust_gating else 1.0, 6),
+        "trust_1_ratio": round(trust_counts[1] / total if total else 0.0, 6),
+        "trust_2_ratio": round(trust_counts[2] / total if total else 0.0, 6),
+        "trust_3_ratio": round(trust_counts[3] / total if total else 0.0, 6),
+        "seed": seed,
+        "command": " ".join(sys.argv),
+    }
+    _write_summary_csv(out_csv, summary_csv_row)
+
     print(f"✓ Saved: {out_file}")
+    print(f"✓ Saved details jsonl: {out_jsonl}")
+    print(f"✓ Saved summary csv: {out_csv}")
 
     return {
-        "combo": combo_tag,
-        "accuracy": accuracy,
-        "correct": correct,
+        "combo": run_tag,
+        "accuracy": (
+            trust_gating_accuracy
+            if run_trust_gating
+            else self_conf_gating_accuracy
+            if run_self_conf_gating
+            else hcqr_accuracy
+        ),
+        "correct": (
+            trust_gating_correct
+            if run_trust_gating
+            else self_conf_gating_correct
+            if run_self_conf_gating
+            else hcqr_correct
+        ),
         "total": total,
         "file": out_file,
     }
@@ -2481,6 +3937,7 @@ def run_batch_phased_evaluation(
     generator_checkpoint: str = None,
     max_questions: int = 1273,
     total_docs: int = 15,
+    question_dataset: str = "medqa",
     gpu_mem: float = 0.9,
     max_model_len: int = 8192,
     max_tokens: int = 2048,
@@ -2499,13 +3956,14 @@ def run_batch_phased_evaluation(
     Args:
         hypothesis_prompt: "v1", "v2", or "v3" (from core/prompts.py)
         rewriting_prompt:  "v1", "v2", or "v3" (from core/prompts.py)
-        generator_prompt:  "v1" or "v2"        (from core/prompts.py)
+        generator_prompt:  "v1", "v2", or "v3" (from core/prompts.py)
     """
     output_dir = resolve_results_output_dir(
         output_dir=output_dir,
         llm_provider="vllm",
         model_name=base_model,
     )
+    set_global_seed(EVAL_FIXED_SEED)
 
     from training.reward import (
         parse_queries_from_completion, parse_hypothesis_plan,
@@ -2524,11 +3982,14 @@ def run_batch_phased_evaluation(
     os.makedirs(output_dir, exist_ok=True)
 
     # Load dataset
-    dataset = MedQADataset()
-    n = min(max_questions, len(dataset))
-    questions = [dataset[i] for i in range(n)]
+    dataset = MedQADataset(question_dataset=question_dataset)
+    capped_total = max(0, min(max_questions, len(dataset)))
+    question_ids = list(range(capped_total))
+    questions = [dataset[i] for i in question_ids]
+    n = len(questions)
     print(f"\n{'='*70}")
     print(f"Batch-Phased Evaluation: {n} questions")
+    print(f"Question set: {question_dataset}")
     print(f"Combo:        {combo_tag}")
     print(f"  hypothesis: {h_prompt['description']}")
     print(f"  rewriting:  {r_prompt['description']}")
@@ -2543,6 +4004,8 @@ def run_batch_phased_evaluation(
     print(f"vllm_tp={vllm_tensor_parallel_size}  "
           f"gpu_mem={gpu_mem}  max_model_len={max_model_len}  "
           f"max_tokens={max_tokens}")
+    print(f"seed={EVAL_FIXED_SEED}  temperature={EVAL_FIXED_TEMPERATURE}")
+    print(f"do_sample={EVAL_FIXED_DO_SAMPLE} (where supported)")
     print(f"{'='*70}")
 
     t_total = time.time()
@@ -2568,21 +4031,59 @@ def run_batch_phased_evaluation(
         vllm_tensor_parallel_size)
 
     plans = []
+    best_guess_correct = 0
+    closest_alternative_correct = 0
+    closest_alternative_rescue = 0
     for idx, text in enumerate(plan_texts):
         p = parse_hypothesis_plan(text)
         p.setdefault("discriminating_features", [])
         p.setdefault("best_guess", "")
+        p.setdefault("best_guess_text", "")
         p.setdefault("reasoning", "")
         p.setdefault("confirming_evidence", [])
         p.setdefault("alternative_if_wrong", "")
+        p.setdefault("closest_alternative", "")
+        p.setdefault("closest_alternative_text", "")
+        p["confidence_level"] = coerce_confidence_level(
+            p.get("confidence_level", 2),
+            default=2,
+        )
         if not p["discriminating_features"]:
             words = re.findall(
                 r'\b[A-Za-z]{4,}\b', questions[idx]["question"])
             p["discriminating_features"] = words[:3] or ["symptom"]
+        p = _enrich_plan_with_alternatives(
+            p,
+            text,
+            questions[idx].get("options", {}),
+        )
+        gold = coerce_choice(questions[idx].get("answer_idx", questions[idx].get("answer", "")))
+        best_guess = coerce_choice(p.get("best_guess", ""))
+        closest_alternative = coerce_choice(
+            p.get("closest_alternative", p.get("alternative_if_wrong", ""))
+        )
+        if best_guess == gold and bool(gold):
+            best_guess_correct += 1
+        if closest_alternative == gold and bool(gold):
+            closest_alternative_correct += 1
+            if best_guess != gold:
+                closest_alternative_rescue += 1
         plans.append(p)
 
     print(f"  ✓ Phase 1 done: {len(plans)} hypotheses "
           f"in {time.time()-t1:.1f}s")
+    best_guess_accuracy = (best_guess_correct / n * 100) if n > 0 else 0.0
+    closest_alternative_accuracy = (
+        closest_alternative_correct / n * 100 if n > 0 else 0.0
+    )
+    top2_accuracy = (
+        (best_guess_correct + closest_alternative_rescue) / n * 100 if n > 0 else 0.0
+    )
+    print(
+        f"  ✓ best_guess={best_guess_accuracy:.2f}% | "
+        f"closest_alt={closest_alternative_accuracy:.2f}% | "
+        f"top2={top2_accuracy:.2f}%"
+    )
 
     # ── Phase 2: Rewrite ALL (rewriter model, subprocess) ──
     print(f"\n[Phase 2/4] Generating queries for {n} questions "
@@ -2600,8 +4101,16 @@ def run_batch_phased_evaluation(
         bg_text = p.get("best_guess_text") or (
             f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}" if bg_letter in qd.get('options', {}) else bg_letter
         )
-        alt_letter = (p.get("alternative_if_wrong", "") or "").strip().upper().rstrip(".")
-        alt_text = f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}" if alt_letter in qd.get('options', {}) else alt_letter
+        alt_letter = (
+            p.get("closest_alternative", "")
+            or p.get("alternative_if_wrong", "")
+            or ""
+        ).strip().upper().rstrip(".")
+        closest_alternative_text = p.get("closest_alternative_text") or ""
+        alt_text = closest_alternative_text or (
+            f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}"
+            if alt_letter in qd.get('options', {}) else alt_letter
+        )
         user = r_prompt["user"].format(
             question=qd["question"],
             options=options_text,
@@ -2614,6 +4123,8 @@ def run_batch_phased_evaluation(
                 p.get("discriminating_features", [])),
             alternative_if_wrong=p.get("alternative_if_wrong", ""),
             alternative_text=alt_text,
+            closest_alternative=p.get("closest_alternative", ""),
+            closest_alternative_text=alt_text,
         )
         rw_messages.append([
             {"role": "system", "content": r_prompt["system"]},
@@ -2728,16 +4239,43 @@ def run_batch_phased_evaluation(
             "context": ctx,
             "question": qd["question"],
             "options": options_text,
+            "hypothesis_summary": "",
+            "queries_summary": "",
+            "best_guess": "",
+            "best_guess_text": "",
+            "closest_alternative": "",
+            "closest_alternative_text": "",
         }
-        # generator v2 needs extra context
-        if generator_prompt == "v2":
+        # generator v2/v3 needs hypothesis context
+        if generator_prompt in {"v2", "v3"}:
             p = plans[i]
+            bg_letter = (p.get("best_guess", "") or "").strip().upper().rstrip(".")
+            bg_text = p.get("best_guess_text") or (
+                f"{bg_letter}. {qd['options'].get(bg_letter, bg_letter)}"
+                if bg_letter in qd.get("options", {})
+                else bg_letter
+            )
+            alt_letter = (
+                p.get("closest_alternative", "")
+                or p.get("alternative_if_wrong", "")
+                or ""
+            ).strip().upper().rstrip(".")
+            closest_alternative_text = p.get("closest_alternative_text") or ""
+            alt_text = closest_alternative_text or (
+                f"{alt_letter}. {qd['options'].get(alt_letter, alt_letter)}"
+                if alt_letter in qd.get("options", {})
+                else alt_letter
+            )
             fmt_vars["hypothesis_summary"] = (
                 f"Best guess: {p.get('best_guess','')} — "
                 f"{p.get('reasoning','')}"
             )
             fmt_vars["queries_summary"] = "\n".join(
                 f"  {j+1}. {q}" for j, q in enumerate(all_queries[i]))
+            fmt_vars["best_guess"] = p.get("best_guess", "")
+            fmt_vars["best_guess_text"] = bg_text
+            fmt_vars["closest_alternative"] = p.get("closest_alternative", "")
+            fmt_vars["closest_alternative_text"] = alt_text
 
         user = g_prompt["user"].format(**fmt_vars)
         ans_messages.append([
@@ -2765,7 +4303,7 @@ def run_batch_phased_evaluation(
             correct += 1
         total += 1
         results.append({
-            "question_id": i,
+            "question_id": question_ids[i],
             "question": qd["question"],
             "options": qd["options"],
             "correct_answer": correct_answer,
@@ -2775,6 +4313,7 @@ def run_batch_phased_evaluation(
                     "num_docs": len(all_docs[i]),
                     "queries": all_queries[i],
                     "plan": plans[i],
+                    "retrieved_docs": _serialize_retrieved_docs_for_output(all_docs[i]),
                     "raw_response": raw_resp,
                     "predicted_answer": predicted,
                     "is_correct": is_correct,
@@ -2794,6 +4333,7 @@ def run_batch_phased_evaluation(
             "hypothesis_prompt": hypothesis_prompt,
             "rewriting_prompt": rewriting_prompt,
             "generator_prompt": generator_prompt,
+            "question_dataset": question_dataset,
             "combo_tag": combo_tag,
             "total_evaluated": total,
             "total_docs": total_docs,
@@ -2808,6 +4348,15 @@ def run_batch_phased_evaluation(
             "questions_per_minute":
                 total / elapsed * 60 if elapsed > 0 else 0,
         },
+        "planner_results": {
+            "best_guess_accuracy": best_guess_accuracy,
+            "best_guess_correct": best_guess_correct,
+            "best_guess_total": total,
+            "closest_alternative_accuracy": closest_alternative_accuracy,
+            "closest_alternative_correct": closest_alternative_correct,
+            "closest_alternative_rescue": closest_alternative_rescue,
+            "top2_accuracy": top2_accuracy,
+        },
         "mode_results": {
             combo_tag: {
                 "correct": correct, "total": total, "accuracy": accuracy,
@@ -2820,11 +4369,19 @@ def run_batch_phased_evaluation(
     print(f"[{combo_tag}] {accuracy:.2f}% ({correct}/{total}) "
           f"in {elapsed:.0f}s "
           f"({summary['timing']['questions_per_minute']:.1f} q/min)")
+    print(
+        f"best_guess={best_guess_accuracy:.2f}% | "
+        f"closest_alt={closest_alternative_accuracy:.2f}% | "
+        f"top2={top2_accuracy:.2f}%"
+    )
     print(f"{'='*70}")
 
     # Save — name encodes prompt combination
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(output_dir, f"medqa_{combo_tag}_{ts}.json")
+    out_file = os.path.join(
+        output_dir,
+        f"{question_dataset}_{combo_tag}_{ts}.json",
+    )
     with open(out_file, "w") as f:
         json.dump({"summary": summary, "results": results},
                   f, indent=2, ensure_ascii=False)
@@ -2850,6 +4407,7 @@ def run_hypothesis_combo(
             hypothesis_checkpoint=args.hypothesis_checkpoint,
             max_questions=args.max_questions,
             total_docs=args.total_docs,
+            question_dataset=args.question_dataset,
             max_tokens=args.vllm_max_tokens,
             max_concurrent=args.max_concurrent,
             output_dir=args.output_dir,
@@ -2859,7 +4417,21 @@ def run_hypothesis_combo(
             rewriting_prompt=rewriting_prompt,
             generator_prompt=generator_prompt,
             api_base=args.api_base,
+            measure_best_guess_only=args.measure_best_guess_only,
+            use_gating=args.use_gating,
+            gating_mode=args.gating_mode,
+            gating_policy=args.gating_policy,
+            trust_threshold=args.trust_threshold,
+            trust_evaluator_model=args.trust_evaluator_model,
+            trust_evaluator_prompt=args.trust_evaluator_prompt,
+            hypothesis_finalizer_prompt=args.hypothesis_finalizer_prompt,
+            seed=EVAL_FIXED_SEED,
         ))
+
+    if args.measure_best_guess_only or args.use_gating:
+        raise ValueError(
+            "best_guess_only / gating options are currently supported only with --llm-provider openai."
+        )
 
     return run_batch_phased_evaluation(
         base_model=model_name,
@@ -2867,6 +4439,7 @@ def run_hypothesis_combo(
         hypothesis_checkpoint=args.hypothesis_checkpoint,
         max_questions=args.max_questions,
         total_docs=args.total_docs,
+        question_dataset=args.question_dataset,
         gpu_mem=args.vllm_gpu_memory_utilization,
         max_model_len=args.vllm_max_model_len,
         max_tokens=args.vllm_max_tokens,
@@ -3017,6 +4590,21 @@ Examples:
       --model Qwen/Qwen3-4B-Instruct-2507 \\
       --hypothesis-checkpoint /path/to/checkpoint-1100
 
+  # Best-guess only (planner) with v7
+  python scripts/evaluate/evaluate.py --mode hypothesis \\
+      --llm-provider openai --model gpt-4o-mini \\
+      --hypothesis-prompt v7 --measure-best-guess-only
+
+  # Direct gating (v7plus self-confidence)
+  python scripts/evaluate/evaluate.py --mode hypothesis \\
+      --llm-provider openai --model gpt-4o-mini \\
+      --gating direct_gating --rewriting-prompt v10 --generator-prompt v1
+
+  # Agentic gating (v7 + evaluator trust)
+  python scripts/evaluate/evaluate.py --mode hypothesis \\
+      --llm-provider openai --model gpt-4o-mini \\
+      --gating agentic_gating --rewriting-prompt v10 --generator-prompt v1
+
   # Baseline modes (cot, directrag, directrewriting)
   python scripts/evaluate/evaluate.py --mode cot --max-questions 1273
   python scripts/evaluate/evaluate.py --mode directrag --max-questions 1273
@@ -3038,15 +4626,15 @@ Examples:
               'Legacy aliases: direct->directrag, baseline->directrewriting'))
     parser.add_argument(
         '--hypothesis-prompt', type=str, default='v1',
-        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'],
+        choices=sorted(HYPOTHESIS_PROMPTS.keys()),
         help='Hypothesis prompt version (default: v1)')
     parser.add_argument(
         '--rewriting-prompt', type=str, default='v1',
-        choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'],
+        choices=sorted(REWRITING_PROMPTS.keys()),
         help='Rewriting prompt version (default: v1)')
     parser.add_argument(
         '--generator-prompt', type=str, default='v1',
-        choices=['v1', 'v2'],
+        choices=sorted(GENERATOR_PROMPTS.keys()),
         help='Generator prompt version (default: v1)')
     parser.add_argument(
         '--run-all', action='store_true',
@@ -3058,6 +4646,60 @@ Examples:
         '--ablation-combos', nargs='+', default=None,
         help=("Prompt combos for hypothesis mode: 'vH-vR' or 'vH-vR-vG' "
               "(e.g., v5-v5-v2 v7-v10-v2)."))
+    parser.add_argument(
+        '--measure-best-guess-only', action='store_true',
+        help='Hypothesis mode only: run planner phase and report best_guess/confidence metrics only.'
+    )
+    parser.add_argument(
+        '--gating', type=str, default=None,
+        choices=['direct_gating', 'agentic_gating'],
+        help=('Hypothesis mode only: gating preset. '
+              'direct_gating = v7plus self-confidence gating; '
+              'agentic_gating = v7 + trust evaluator gating. '
+              'If omitted, gating is disabled.')
+    )
+    # Backward-compatible flags (hidden)
+    parser.add_argument(
+        '--use-gating', action='store_true',
+        help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        '--gating-mode', type=str, default='both',
+        choices=['self_confidence', 'trust_eval', 'both'],
+        help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        '--gating-policy', type=str, default='conf3_skip',
+        choices=['conf3_skip', 'conf23_skip', 'conf3_only_retrieve'],
+        help=('Self-confidence gating policy when --use-gating and '
+              '--gating-mode includes self_confidence. '
+              'conf3_skip: retrieve on conf 1/2; '
+              'conf23_skip: retrieve on conf 1 only; '
+              'conf3_only_retrieve: retrieve on conf 3 only.')
+    )
+    parser.add_argument(
+        '--trust-threshold', type=int, default=3, choices=[1, 2, 3],
+        help=('Trust gating threshold when --gating-mode includes trust_eval. '
+              'high-trust is trust_level >= threshold (default: 3).')
+    )
+    parser.add_argument(
+        '--trust-evaluator-model', type=str, default=None,
+        help='Model for trust evaluator phase (default: --model).'
+    )
+    parser.add_argument(
+        '--trust-evaluator-prompt', type=str, default='v1',
+        choices=sorted(TRUST_EVALUATOR_PROMPTS.keys()),
+        help='Trust evaluator prompt version (default: v1).'
+    )
+    parser.add_argument(
+        '--hypothesis-finalizer-prompt', type=str, default='v1',
+        choices=sorted(HYPOTHESIS_FINALIZER_PROMPTS.keys()),
+        help='Hypothesis finalizer prompt version for high-trust branch (default: v1).'
+    )
+    parser.add_argument(
+        '--seed', type=int, default=42,
+        help='Ignored at runtime. Evaluation seed is fixed to 42.'
+    )
 
     # ── Model & checkpoints ──
     parser.add_argument('--model', type=str, default='gpt-4o-mini')
@@ -3080,6 +4722,12 @@ Examples:
         default=RETRIEVAL_DATASET_TO_CORPUS["textbooks"],
         metavar='{textbooks,pubmed}',
         help='Retrieval dataset (default: textbooks)')
+    parser.add_argument(
+        '--question-dataset',
+        type=parse_question_dataset,
+        default='medqa',
+        metavar='{' + ",".join(QUESTION_DATASET_CHOICES) + '}',
+        help='Question dataset in benchmark.json (default: medqa)')
     parser.add_argument('--corpus', type=str, default=None,
                        help=argparse.SUPPRESS)
     parser.add_argument(
@@ -3096,10 +4744,41 @@ Examples:
     parser.add_argument('--vllm-max-tokens', type=int, default=2048)
     parser.add_argument('--vllm-max-concurrent', type=int, default=1)
     parser.add_argument('--vllm-max-model-len', type=int, default=8192)
+    parser.add_argument('--question-timeout-seconds', type=int, default=600)
 
     args = parser.parse_args()
     args.mode = normalize_mode_name(args.mode)
+
+    # Normalize gating preset into internal legacy flags.
+    run_ablation_requested = bool(
+        args.run_all or args.ablation_models is not None or args.ablation_combos is not None
+    )
+    if args.gating is not None and run_ablation_requested:
+        raise ValueError("--gating cannot be combined with --run-all/--ablation-* options.")
+
+    if args.gating == "direct_gating":
+        args.use_gating = True
+        args.gating_mode = "self_confidence"
+        if args.hypothesis_prompt != "v7plus":
+            print("INFO: --gating direct_gating uses v7plus planner. Overriding --hypothesis-prompt to v7plus.")
+            args.hypothesis_prompt = "v7plus"
+    elif args.gating == "agentic_gating":
+        args.use_gating = True
+        args.gating_mode = "trust_eval"
+        if args.hypothesis_prompt != "v7":
+            print("INFO: --gating agentic_gating uses v7 planner. Overriding --hypothesis-prompt to v7.")
+            args.hypothesis_prompt = "v7"
+
+    if args.seed != EVAL_FIXED_SEED:
+        print(f"INFO: --seed {args.seed} ignored; using fixed seed={EVAL_FIXED_SEED}")
+    args.seed = EVAL_FIXED_SEED
+    set_global_seed(args.seed)
     corpus_name = args.corpus if args.corpus else args.retrieval_dataset
+
+    if args.mode != "hypothesis" and (args.use_gating or args.measure_best_guess_only or args.gating is not None):
+        raise ValueError(
+            "--gating/--use-gating and --measure-best-guess-only are supported only with --mode hypothesis."
+        )
 
     if args.mode == 'hypothesis':
         run_hypothesis_mode(args, corpus_name)
@@ -3112,6 +4791,7 @@ Examples:
         model_name=args.model,
         retriever_name=args.retriever,
         corpus_name=corpus_name,
+        question_dataset=args.question_dataset,
         max_concurrent=args.max_concurrent,
         output_dir=args.output_dir,
         modes=[args.mode],
@@ -3120,6 +4800,7 @@ Examples:
         vllm_max_tokens=args.vllm_max_tokens,
         vllm_max_concurrent=args.vllm_max_concurrent,
         vllm_max_model_len=args.vllm_max_model_len,
+        question_timeout_seconds=args.question_timeout_seconds,
         total_docs=args.total_docs,
         # Baseline path uses the base model for query rewriting.
         rewriter_adapter_path=None,

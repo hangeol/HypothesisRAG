@@ -21,6 +21,58 @@ from typing import Any, Dict, Optional, Tuple
 # ============================================================================
 # Format variables: {question}, {options}
 
+HYPOTHESIS_V7_USER_PROMPT = (
+    "Question: {question}\n\n"
+    "Options:\n{options}\n\n"
+    "Analyze this question carefully. Think step-by-step about "
+    "each option, considering the presentation and "
+    "relevant knowledge. Reason through the elimination analysis "
+    "before making your final assessment.\n\n"
+    "After your analysis, provide your final assessment in JSON:\n"
+    '{{\n'
+    '    "discriminating_features": '
+    '["2-3 features that distinguish between options"],\n'
+    '    "best_guess": "A/B/C/D",\n'
+    '    "best_guess_text": '
+    '"<<<copy the chosen option text verbatim>>>",\n'
+    '    "reasoning": '
+    '"brief explanation why this is the best answer",\n'
+    '    "confirming_evidence": '
+    '["1-3 specific facts that would confirm this answer"],\n'
+    '    "alternative_if_wrong": "A/B/C/D - only if uncertain"\n'
+    '}}'
+)
+
+HYPOTHESIS_V7PLUS_USER_PROMPT = (
+    "Question: {question}\n\n"
+    "Options:\n{options}\n\n"
+    "Self-confidence scale for your final best_guess:\n"
+    "1 = not confident (high chance of being wrong)\n"
+    "2 = somewhat confident (ambiguous)\n"
+    "3 = very confident (almost certain)\n"
+    "Use 3 only when you are strongly certain. "
+    "If torn between options, use 1 or 2.\n\n"
+    "Analyze this question carefully. Think step-by-step about "
+    "each option, considering the presentation and "
+    "relevant knowledge. Reason through the elimination analysis "
+    "before making your final assessment.\n\n"
+    "Return exactly one JSON object in this format:\n"
+    '{{\n'
+    '    "discriminating_features": '
+    '["2-3 features that distinguish between options"],\n'
+    '    "best_guess": "A/B/C/D",\n'
+    '    "best_guess_text": '
+    '"<<<copy the chosen option text verbatim>>>",\n'
+    '    "reasoning": '
+    '"brief explanation why this is the best answer",\n'
+    '    "confirming_evidence": '
+    '["1-3 specific facts that would confirm this answer"],\n'
+    '    "alternative_if_wrong": "A/B/C/D - only if uncertain",\n'
+    '    "confidence_level": "<1|2|3>"\n'
+    '}}\n\n'
+    "confidence_level must be an integer in {{1,2,3}} only."
+)
+
 HYPOTHESIS_PROMPTS = {
     "v1": {
         "system": (
@@ -180,10 +232,12 @@ HYPOTHESIS_PROMPTS = {
         "description": "Universal v6 (no exam/ABCD hints, no alternative)",
     },
     "v7": {
-        "system": (
-            "You are an expert analyst "
-            "taking an exam."
-        ),
+        "system":"You are an expert analyst taking an exam.",
+        "user": HYPOTHESIS_V7_USER_PROMPT,
+        "description": "hv5 + best_guess_text field in JSON",
+    },
+    "v8": {
+        "system":"You are an expert analyst taking an exam.",#"You are an expert question-answering assistant.",
         "user": (
             "Question: {question}\n\n"
             "Options:\n{options}\n\n"
@@ -195,17 +249,114 @@ HYPOTHESIS_PROMPTS = {
             '{{\n'
             '    "discriminating_features": '
             '["2-3 features that distinguish between options"],\n'
-            '    "best_guess": "A/B/C/D",\n'
-            '    "best_guess_text": '
-            '"<<<copy the chosen option text verbatim>>>",\n'
             '    "reasoning": '
             '"brief explanation why this is the best answer",\n'
             '    "confirming_evidence": '
             '["1-3 specific facts that would confirm this answer"],\n'
-            '    "alternative_if_wrong": "A/B/C/D - only if uncertain"\n'
+            '    "best_guess": "A/B/C/D",\n'
+            '    "best_guess_text": '
+            '"<<<copy the chosen option text verbatim>>>",\n'
+            '    "closest_alternative": "A/B/C/D",\n'
+            '    "closest_alternative_text": '
+            '"<<<copy the closest alternative option text verbatim>>>"\n'
             '}}'
         ),
         "description": "hv5 + best_guess_text field in JSON",
+    }, "v9": {
+        "system":"You are an expert analyst taking an exam.",#"You are an expert question-answering assistant.",
+        "user": (
+            "Question: {question}\n\n"
+            "Options:\n{options}\n\n"
+            "Analyze this question carefully. Think step-by-step about "
+            "each option, considering the information given in the question and "
+            "relevant knowledge. Reason through the elimination analysis "
+            "before making your final assessment.\n\n"
+            "After your analysis, provide your final assessment in JSON:\n"
+            '{{\n'
+            '    "discriminating_features": '
+            '["2-3 features that distinguish between options"],\n'
+            '    "reasoning": '
+            '"brief explanation why this is the best answer",\n'
+            '    "confirming_evidence": '
+            '["1-3 specific facts that would confirm this answer"],\n'
+            '    "best_guess": "A/B/C/D",\n'
+            '    "best_guess_text": '
+            '"<<<copy the chosen option text verbatim>>>",\n'
+            '}}'
+        ),
+        "description": "hv5 + best_guess_text field in JSON",
+    },
+    "v7_sys_medrag": {
+        "system": (
+            "You are a board-certified physician answering a high-stakes "
+            "medical exam question. Be clinically precise and avoid overclaiming."
+        ),
+        "user": HYPOTHESIS_V7_USER_PROMPT,
+        "description": "v7 with MedRAG-style clinical expert tone",
+    },
+    "v7_sys_calibrated": {
+        "system": (
+            "You are an expert medical reasoner. Avoid overconfidence and make "
+            "conservative conclusions when evidence is mixed."
+        ),
+        "user": HYPOTHESIS_V7_USER_PROMPT,
+        "description": "v7 with calibrated certainty style",
+    },
+    "v7_sys_diffdx": {
+        "system": (
+            "You are an expert diagnostician. Prioritize differential diagnosis, "
+            "explicitly weighing strongest support and strongest contradiction."
+        ),
+        "user": HYPOTHESIS_V7_USER_PROMPT,
+        "description": "v7 with differential-diagnosis focused reasoning style",
+    },
+    "v7_sys_strict_json": {
+        "system": (
+            "You are an expert analyst. Return structured, faithful outputs only. "
+            "Do not include extra text outside the required JSON."
+        ),
+        "user": HYPOTHESIS_V7_USER_PROMPT,
+        "description": "v7 with strict formatting emphasis",
+    },
+    "v7plus": {
+        "system": (
+            "You are an expert analyst "
+            "taking an exam."
+        ),
+        "user": HYPOTHESIS_V7PLUS_USER_PROMPT,
+        "description": "v7 + self-reported confidence_level(1/2/3) for gating",
+    },
+    "v7plus_sys_medrag": {
+        "system": (
+            "You are a board-certified physician answering a high-stakes "
+            "medical exam question. Be clinically precise and avoid overclaiming."
+        ),
+        "user": HYPOTHESIS_V7PLUS_USER_PROMPT,
+        "description": "v7plus with MedRAG-style clinical expert tone",
+    },
+    "v7plus_sys_calibrated": {
+        "system": (
+            "You are an expert medical reasoner. Calibrate confidence strictly: "
+            "reserve very high confidence for clear textbook presentations."
+        ),
+        "user": HYPOTHESIS_V7PLUS_USER_PROMPT,
+        "description": "v7plus with explicit confidence calibration emphasis",
+    },
+    "v7plus_sys_diffdx": {
+        "system": (
+            "You are an expert diagnostician. Prioritize differential diagnosis, "
+            "explicitly weighing strongest support and strongest contradiction."
+        ),
+        "user": HYPOTHESIS_V7PLUS_USER_PROMPT,
+        "description": "v7plus with differential-diagnosis focused reasoning style",
+    },
+    "v7plus_sys_strict_json": {
+        "system": (
+            "You are an expert analyst. Return structured, faithful outputs only. "
+            "Do not inflate certainty when evidence is mixed."
+        ),
+        "user": HYPOTHESIS_V7PLUS_USER_PROMPT,
+        "description": "v7plus with strict formatting + uncertainty honesty",
     },
 }
 
@@ -490,17 +641,69 @@ REWRITING_PROMPTS = {
         ),
         "description": "rv5 with best_guess_text replacing best_guess",
     },
+    "v11": {
+        "system": (
+            "You are a search query expert. "
+            "Generate precise, targeted search queries. "
+            "Output ONLY the 3 queries in the exact format requested."
+        ),
+        "user": (
+            "Generate 3 highly targeted search queries to find evidence "
+            "for this question.\n\n"
+            "Question: {question}\n"
+            "Best Guess Answer: {best_guess_text}\n"
+            "Reasoning: {reasoning}\n"
+            "Evidence Needed: {confirming_evidence}\n"
+            "Key Features: {discriminating_features}\n\n"
+            "Closest Alternative: {closest_alternative_text}\n"
+            "Generate 3 SPECIFIC queries:\n"
+            "Query 1: Find evidence supporting {best_guess_text} "
+            "- focus on the main reasoning\n"
+            "Query 2: Find distinguishing criteria "
+            "between the top candidate answers\n"
+            "Query 3: Find specific key features or facts\n\n"
+            "Format:\n"
+            "Query 1: [query]\n"
+            "Query 2: [query]\n"
+            "Query 3: [query]"
+        ),
+        "description": "rv5 with best_guess_text replacing best_guess",
+    },
+    "v12": {
+        "system": (
+            "You are a search query expert. "
+            "Generate precise, targeted search queries. "
+            "Output ONLY the 3 queries in the exact format requested."
+        ),
+        "user": (
+            "Generate 3 highly targeted search queries to find evidence "
+            "for this question.\n\n"
+            "Question: {question}\n"
+            "Best Guess Answer: {best_guess_text}\n"
+            "Closest Alternative: {closest_alternative_text}\n"
+            "Reasoning: {reasoning}\n"
+            "Evidence Needed: {confirming_evidence}\n"
+            "Key Features: {discriminating_features}\n\n"
+            "Generate 3 SPECIFIC queries:\n"
+            "Query 1: Find evidence supporting {best_guess_text} "
+            "- focus on the main reasoning\n"
+            "Query 2: Find distinguishing criteria "
+            "between the top candidate answers\n"
+            "Query 3: Find specific key features or facts\n\n"
+            "Format:\n"
+            "Query 1: [query]\n"
+            "Query 2: [query]\n"
+            "Query 3: [query]"
+        ),
+        "description": "rv5 with best_guess_text replacing best_guess",
+    },
 }
 
 
 
 COT_SYSTEM_PROMPT = '''You are a helpful medical expert, and your task is to answer a multi-choice medical question. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
+MEDRAG_SYSTEM_PROMPT = '''You are a helpful medical expert, and your task is to answer a multi-choice medical question using the relevant documents. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
 
-
-MIRAGE_SYSTEM_PROMPT = '''You are a helpful medical expert, and your task is to answer a multi-choice medical question using the relevant documents. Please first think step-by-step and then choose the answer from the provided options. Organize your output in a json formatted as Dict{"step_by_step_thinking": Str(explanation), "answer_choice": Str{A/B/C/...}}. Your responses will be used for research purposes only, so please have a definite answer.'''
-
-
-# CoT user message template.
 COT_USER_PROMPT_TEMPLATE = '''
 Here is the question:
 {question}
@@ -511,7 +714,6 @@ Here are the potential choices:
 Please think step-by-step and generate your output in json:
 '''
 
-# MedRAG user message template (used by directrag/directrewriting and generator v1 style).
 MEDRAG_USER_PROMPT_TEMPLATE = '''
 Here are the relevant documents:
 {context}
@@ -579,34 +781,96 @@ Output in JSON format:
 # v1 format variables: {context}, {question}, {options}
 # v2 format variables: {context}, {question}, {options},
 #                       {hypothesis_summary}, {queries_summary}
+# v3 format variables: {context}, {question}, {options},
+#                       {hypothesis_summary}, {queries_summary},
+#                       {best_guess_text}, {closest_alternative_text}
 
 GENERATOR_PROMPTS = {
     "v1": {
-        "system": MIRAGE_SYSTEM_PROMPT,
+        "system": MEDRAG_SYSTEM_PROMPT,
         "user":MEDRAG_USER_PROMPT_TEMPLATE,
         "description": "Standard MIRAGE generator",
     },
     "v2": {
-        "system": (
-            'You are a helpful medical expert, and your task is to answer '
-            'a multi-choice medical question using the relevant documents '
-            'and diagnostic hypothesis. '
-            'Please first think step-by-step and then choose the answer '
-            'from the provided options. Organize your output in a json '
-            'formatted as Dict{"step_by_step_thinking": Str(explanation), '
-            '"answer_choice": Str{A/B/C/...}}. Your responses will be '
-            'used for research purposes only, so please have a definite answer.'
-        ),
+        "system": MEDRAG_SYSTEM_PROMPT,
         "user": (
+            "Here is the question:\n{question}\n\n"
+            "Here are the potential choices:\n{options}\n\n"
             "Diagnostic Hypothesis:\n{hypothesis_summary}\n\n"
             "Search Queries Used:\n{queries_summary}\n\n"
             "Here are the relevant documents:\n{context}\n\n"
-            "Here is the question:\n{question}\n\n"
-            "Here are the potential choices:\n{options}\n\n"
             "Consider the diagnostic hypothesis and retrieved evidence. "
             "Think step-by-step and generate your output in json:"
         ),
         "description": "MIRAGE generator with hypothesis context",
+    },
+    "v3": {
+        "system": MEDRAG_SYSTEM_PROMPT,
+        "user": (
+            "Here is the question:\n{question}\n\n"
+            "Here are the potential choices:\n{options}\n\n"
+            "Primary Hypothesis Candidate:\n{best_guess_text}\n\n"
+            "Closest Alternative Candidate:\n{closest_alternative_text}\n\n"
+            "Diagnostic Hypothesis:\n{hypothesis_summary}\n\n"
+            "Search Queries Used:\n{queries_summary}\n\n"
+            "Here are the relevant documents:\n{context}\n\n"
+            "Use retrieved documents as primary evidence. "
+            "Treat hypothesis and closest alternative as reference signals only. "
+            "If document evidence conflicts with those references, follow the documents. "
+            "Think step-by-step and generate your output in json:"
+        ),
+        "description": "MIRAGE generator with hypothesis + closest alternative context",
+    },
+}
+
+
+# ============================================================================
+# Trust Evaluator / Hypothesis Finalizer Prompts
+# ============================================================================
+
+TRUST_EVALUATOR_PROMPTS = {
+    "v1": {
+        "system": (
+            "You are a strict medical QA auditor. Evaluate only whether the given "
+            "hypothesis JSON is reliable for final answering."
+        ),
+        "user": (
+            "Question:\n{question}\n\n"
+            "Options:\n{options}\n\n"
+            "Hypothesis JSON:\n{hypothesis_json}\n\n"
+            "Assess whether this hypothesis is trustworthy.\n"
+            "Return exactly one JSON object:\n"
+            '{{\n'
+            '  "hypothesis_trust": 1,\n'
+            '  "trust_reason": "short reason",\n'
+            '  "risk_flags": ["up to 3 concise risks"]\n'
+            '}}\n\n'
+            "Scale:\n"
+            "1 = low trust (likely wrong/incomplete)\n"
+            "2 = medium trust (usable but uncertain)\n"
+            "3 = high trust (coherent and likely correct)\n"
+            "hypothesis_trust must be an integer in {{1,2,3}} only."
+        ),
+        "description": "Trust evaluator over full hypothesis JSON",
+    },
+}
+
+
+HYPOTHESIS_FINALIZER_PROMPTS = {
+    "v1": {
+        "system": (
+            "You are a medical expert. Answer a multi-choice medical question "
+            "using only the provided hypothesis JSON and question/options. "
+            "Return JSON with answer_choice."
+        ),
+        "user": (
+            "Question:\n{question}\n\n"
+            "Options:\n{options}\n\n"
+            "Hypothesis JSON:\n{hypothesis_json}\n\n"
+            "Using only this hypothesis, choose the best final answer.\n"
+            'Return JSON: {{"step_by_step_thinking": "...", "answer_choice": "A/B/C/D"}}'
+        ),
+        "description": "No-retrieval finalizer conditioned on hypothesis JSON",
     },
 }
 
@@ -614,128 +878,6 @@ GENERATOR_PROMPTS = {
 # ============================================================================
 # Baseline Prompts (for non-hypothesis modes: cot, directrag, directrewriting)
 # ============================================================================
-
-
-
-
-
-
-
-# ============================================================================
-# Helper: Load MIRAGE template prompts (override defaults if available)
-# ============================================================================
-def _find_mirage_template_path() -> Optional[Path]:
-    """Return MIRAGE template.py path if available in this project."""
-    project_root = Path(__file__).resolve().parents[1]
-    template_path = project_root / "MIRAGE" / "MedRAG" / "src" / "template.py"
-    if template_path.exists():
-        return template_path
-    return None
-
-
-def _read_mirage_system_prompts() -> Optional[Tuple[str, str]]:
-    """
-    Load MIRAGE system prompts from template.py without mutating sys.path.
-
-    Returns:
-        (general_medrag_system, general_cot_system) if available, else None.
-    """
-    template_path = _find_mirage_template_path()
-    if template_path is None:
-        return None
-
-    loaded_from_import = _read_mirage_system_prompts_via_import(template_path)
-    if loaded_from_import is not None:
-        return loaded_from_import
-    return _read_mirage_system_prompts_via_source(template_path)
-
-
-def _read_mirage_system_prompts_via_import(
-    template_path: Path,
-) -> Optional[Tuple[str, str]]:
-    """Load prompts by importing template.py."""
-    spec = importlib_util.spec_from_file_location(
-        "hypothesisrag_mirage_template",
-        str(template_path),
-    )
-    if spec is None or spec.loader is None:
-        return None
-
-    module = importlib_util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        return None
-
-    medrag_system = getattr(module, "general_medrag_system", None)
-    cot_system = getattr(module, "general_cot_system", None)
-    if isinstance(medrag_system, str) and isinstance(cot_system, str):
-        return medrag_system, cot_system
-    return None
-
-
-def _read_mirage_system_prompts_via_source(
-    template_path: Path,
-) -> Optional[Tuple[str, str]]:
-    """
-    Fallback path for environments missing template.py dependencies.
-
-    We only need two constant strings, so parse assignment nodes directly.
-    """
-    try:
-        source = template_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(template_path))
-    except Exception:
-        return None
-
-    values = {}
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        if target.id not in {"general_medrag_system", "general_cot_system"}:
-            continue
-
-        value_node = node.value
-        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
-            values[target.id] = value_node.value
-        elif isinstance(value_node, ast.Str):
-            values[target.id] = value_node.s
-
-    medrag_system = values.get("general_medrag_system")
-    cot_system = values.get("general_cot_system")
-    if isinstance(medrag_system, str) and isinstance(cot_system, str):
-        return medrag_system, cot_system
-    return None
-
-
-def load_mirage_prompts() -> bool:
-    """
-    Override built-in system prompts with MIRAGE's canonical template prompts.
-
-    Why this exists:
-      - Keeps CoT and generator system prompts aligned with
-        MIRAGE/MedRAG/src/template.py.
-      - Prevents drift between copied local prompt text and upstream MIRAGE.
-    """
-    global COT_SYSTEM_PROMPT, MIRAGE_SYSTEM_PROMPT
-
-    loaded = _read_mirage_system_prompts()
-    if loaded is None:
-        return False
-
-    medrag_system, cot_system = loaded
-    MIRAGE_SYSTEM_PROMPT = medrag_system
-    COT_SYSTEM_PROMPT = cot_system
-
-    # Keep generator v1/v2 system prompts aligned with MIRAGE.
-    GENERATOR_PROMPTS["v1"]["system"] = medrag_system
-    GENERATOR_PROMPTS["v2"]["system"] = medrag_system
-    return True
 
 
 def get_evaluate_prompt_bundle() -> Dict[str, Any]:
@@ -749,9 +891,11 @@ def get_evaluate_prompt_bundle() -> Dict[str, Any]:
         "hypothesis": HYPOTHESIS_PROMPTS,
         "rewriter": REWRITING_PROMPTS,
         "generator": GENERATOR_PROMPTS,
+        "trust_evaluator": TRUST_EVALUATOR_PROMPTS,
+        "hypothesis_finalizer": HYPOTHESIS_FINALIZER_PROMPTS,
         "system": {
             "cot": COT_SYSTEM_PROMPT,
-            "medrag": MIRAGE_SYSTEM_PROMPT,
+            "medrag": MEDRAG_SYSTEM_PROMPT,
         },
         "answer": {
             "cot_user": COT_USER_PROMPT_TEMPLATE,

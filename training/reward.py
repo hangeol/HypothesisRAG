@@ -130,39 +130,137 @@ def _coerce_str_list(value: Any) -> List[str]:
     return []
 
 
+def _extract_first_json_object(answer_text: str) -> Optional[Dict[str, Any]]:
+    """Extract first valid JSON object from arbitrary text."""
+    text = str(answer_text)
+    n = len(text)
+    for start in range(n):
+        if text[start] != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for end in range(start, n):
+            ch = text[end]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:end + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except (json.JSONDecodeError, ValueError):
+                        break
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+    return None
+
+
+def _coerce_choice_letter(value: Any) -> str:
+    """Normalize answer choice into A/B/C/D."""
+    if value is None:
+        return ""
+    text = str(value).upper().strip()
+    match = re.findall(r"\b([ABCD])\b", text)
+    return match[-1] if match else ""
+
+
+def _coerce_confidence_level(value: Any, default: int = 2) -> int:
+    """Normalize confidence into integer 1/2/3."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value in (1, 2, 3) else default
+    text = str(value).strip()
+    if not text:
+        return default
+    m = re.search(r"\b([123])\b", text)
+    if m:
+        return int(m.group(1))
+    return default
+
+
+def parse_trust_evaluation(answer_text: str) -> Dict[str, Any]:
+    """Parse trust evaluator output JSON from mixed text."""
+    if not answer_text:
+        answer_text = ""
+
+    text = str(answer_text)
+    trust_data = _extract_first_json_object(text) or {}
+
+    if not trust_data:
+        m = re.search(
+            r'"?hypothesis[_\s-]*trust"?\s*[:=]\s*["\']?([123])["\']?',
+            text,
+            re.IGNORECASE,
+        )
+        trust_data = {"hypothesis_trust": int(m.group(1)) if m else 2}
+
+    parsed = {
+        "hypothesis_trust": _coerce_confidence_level(
+            trust_data.get("hypothesis_trust", 2),
+            default=2,
+        ),
+        "trust_reason": str(trust_data.get("trust_reason", "") or "").strip(),
+        "risk_flags": _coerce_str_list(trust_data.get("risk_flags", [])),
+    }
+    return parsed
+
+
 def parse_hypothesis_plan(answer_text: str) -> Dict[str, Any]:
     """Parse hypothesis / plan output from hypothesis model completion."""
     if not answer_text:
-        return {}
+        answer_text = ""
 
     text = str(answer_text)
-    try:
-        if "{" in text and "}" in text:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            plan_data = json.loads(text[start:end])
-            if isinstance(plan_data, dict):
-                return plan_data
-    except (json.JSONDecodeError, ValueError):
-        pass
+    plan_data = _extract_first_json_object(text) or {}
 
-    # Fallback: regex parse best_guess
-    best_guess = None
-    match = re.search(r'"?best[_\s-]*guess"?\s*[:=]\s*["\']?([ABCD])["\']?', text, re.IGNORECASE)
-    if match:
-        best_guess = match.group(1).upper()
-
-    if not best_guess:
-        match = re.search(r"\bBEST\s*GUESS\b[^A-D]{0,40}\b([ABCD])\b", text, re.IGNORECASE)
+    # Regex fallback when JSON parsing fails
+    if not plan_data:
+        best_guess = None
+        match = re.search(
+            r'"?best[_\s-]*guess"?\s*[:=]\s*["\']?([ABCD])["\']?',
+            text,
+            re.IGNORECASE,
+        )
         if match:
             best_guess = match.group(1).upper()
+        if not best_guess:
+            match = re.search(r"\bBEST\s*GUESS\b[^A-D]{0,40}\b([ABCD])\b", text, re.IGNORECASE)
+            if match:
+                best_guess = match.group(1).upper()
+        plan_data = {"best_guess": best_guess or ""}
 
     plan: Dict[str, Any] = {
-        "discriminating_features": [],
-        "best_guess": best_guess or "",
-        "reasoning": "",
-        "confirming_evidence": [],
-        "alternative_if_wrong": "",
+        "discriminating_features": _coerce_str_list(
+            plan_data.get("discriminating_features", [])
+        ),
+        "best_guess": _coerce_choice_letter(plan_data.get("best_guess", "")),
+        "best_guess_text": str(plan_data.get("best_guess_text", "") or "").strip(),
+        "reasoning": str(plan_data.get("reasoning", "") or "").strip(),
+        "confirming_evidence": _coerce_str_list(
+            plan_data.get("confirming_evidence", [])
+        ),
+        "alternative_if_wrong": _coerce_choice_letter(
+            plan_data.get("alternative_if_wrong", "")
+        ),
+        "confidence_level": _coerce_confidence_level(
+            plan_data.get("confidence_level", 2),
+            default=2,
+        ),
     }
     return plan
 
