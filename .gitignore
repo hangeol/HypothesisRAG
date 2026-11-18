@@ -1,14 +1,23 @@
-corpus/*
-results/*
-logs/*
-MIRAGE/MedRAG/cache/*
-MIRAGE/MedRAG/corpus/*
-MIRAGE/prediction/*
-MIRAGE/rawdata/*
-MIRAGE/results/*
-outputs/*
+# Runtime inputs and outputs stay local.
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+.vscode/
+outputs/
+results/
+logs/
 *.log
-trainlog.txt
-
-# Local MedGemma outputs may contain retrieved corpus text and full prompts.
-/MIRAGE/medgemma_medqa_rag_results_*.json
+cache/
+corpus/
+MIRAGE/benchmark.json
+data/
+MIRAGE/prediction/
+MIRAGE/rawdata/
+MIRAGE/results/
+MIRAGE/medgemma_medqa_rag_results_*.json
+*.safetensors
+*.pt
+*.pth

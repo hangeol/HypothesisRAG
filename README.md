@@ -1,238 +1,151 @@
-# HypothesisRAG
+<div align="center">
 
-MedQA 기반 HypothesisRAG 실험 코드입니다.  
-현재 구조는 `평가(Evaluate) / 학습(Train) / 분석(Analysis) / 과거(Past)`로 분리되어 있습니다.
+# HYPER
+### Hypothesis-Guided Planning for Evidence-Seeking Retrieval
 
-## 1. 폴더 구조
+**Hangeol Chang · Changsun Lee · Seungjoon Rho · Junho Yeo · Jong Chul Ye**
 
-```text
-HypothesisRAG/
-├── scripts/
-│   ├── evaluate/
-│   │   ├── evaluate.py                 # (기존 evaluate_medqa_v2.py)
-│   │   ├── evaluate_checkpoints.py     # 체크포인트 스윕 평가
-│   ├── train/
-│   │   └── run_training.sh             # 학습 실행 래퍼
-│   ├── analysis/
-│   │   ├── eval_grpo.py
-│   │   ├── analyze_failure_modes.py
-│   │   ├── analyze_best_guess_vs_gold.py
-│   │   ├── compare_v4_v5_results.py
-│   │   └── prune_checkpoints_for_inference.py
-│   └── past/
-│       ├── evaluate_past.py            # (기존 evaluate_medqa.py)
-│       ├── run_ablation_gpu*.sh
-│       ├── run_rag.py
-│       ├── test_rag.py
-│       └── etc/*                       # legacy 코드
-├── training/
-│   ├── train_hypothesis_grpo.py
-│   ├── train_rewriter_grpo.py
-│   └── reward.py
-├── core/
-│   ├── prompts.py                    # canonical prompt registry
-│   └── rag_core.py                   # canonical RAG core module
-├── data/
-├── outputs/
-├── retrieval/
-│   └── retriever.py                  # canonical retriever module
-└── requirements*.txt
-```
+**EACL 2027**
 
-## 2. 환경 설정
+[Preprint](https://arxiv.org/abs/2603.19008) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Citation](#citation)
 
-### 2.1 Conda
+**Plan what evidence to retrieve before deciding what answer to give.**
+
+</div>
+
+<p align="center">
+  <img src="assets/hyper-overview.png" width="100%" alt="HYPER forms a provisional hypothesis, writes Support, Distinction, and Feature queries, retrieves and fuses evidence, and generates the final answer.">
+</p>
+<p align="center"><em>The HYPER pipeline, from Figure 1(a) of the paper.</em></p>
+
+HYPER is a training-free retrieval planning method. A provisional answer guides three complementary searches for supporting evidence, distinguishing criteria, and question-specific features. The final generator answers from the retrieved context and can revise the initial hypothesis.
+
+This repository provides the HYPER inference pipeline and evaluation entry point for **MedQA** and **MMLU-Med**.
+
+## Quick start
+
+### 1. Install
+
+Use Linux, Python 3.10+, and a CUDA GPU compatible with vLLM. Install Git, Git LFS, `wget`, and `unzip` for the upstream retrieval resources.
 
 ```bash
-conda create -n hypothesisrag python=3.10 -y
-conda activate hypothesisrag
-```
+git clone https://github.com/hangeol/HypothesisRAG.git
+cd HypothesisRAG
 
-### 2.2 패키지 설치
-
-전체(평가+학습+분석):
-
-```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+git lfs install
 ```
 
-선택 설치:
+### 2. Prepare the questions
 
 ```bash
-pip install -r requirements-eval.txt
-pip install -r requirements-train.txt
-pip install -r requirements-analysis.txt
+python scripts/prepare_data.py
 ```
 
-### 2.3 환경변수
+This downloads the MIRAGE benchmark collection and verifies its checksum. The evaluation subsets contain **1,273 MedQA** and **1,089 MMLU-Med** questions. Dataset records stay local.
+
+The first retrieval run prepares the Textbooks corpus and MedCPT index through MedRAG. Allow additional time and disk space for this initial download and indexing step. Model weights are downloaded through Hugging Face; authenticate and obtain access approval where required.
+
+### 3. Run
+
+Start with a small run:
 
 ```bash
-export OPENAI_API_KEY="<your_key>"
+CUDA_VISIBLE_DEVICES=0 python -m hyper --dataset medqa --limit 5
 ```
 
-## 3. 결과 저장 규칙
+Evaluate either benchmark:
 
-`scripts/evaluate/evaluate.py`는 `--output-dir`를 지정하지 않으면 자동으로 아래에 저장합니다.
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hyper --dataset medqa
+CUDA_VISIBLE_DEVICES=0 python -m hyper --dataset mmlu
+```
+
+The default model is `Qwen/Qwen3-4B-Instruct-2507`. Choose another model with `--model`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hyper \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset medqa
+```
+
+<details>
+<summary><strong>Models and hardware options</strong></summary>
+
+The medical benchmark experiments use these four base models:
+
+| Model | Hugging Face identifier |
+| --- | --- |
+| Llama 3.2 3B | `meta-llama/Llama-3.2-3B-Instruct` |
+| Llama 3.1 8B | `meta-llama/Llama-3.1-8B-Instruct` |
+| Qwen3 4B | `Qwen/Qwen3-4B-Instruct-2507` |
+| Qwen3 30B-A3B | `Qwen/Qwen3-30B-A3B-Instruct-2507` |
+
+The same model serves hypothesis formation, query formulation, and final generation. GPU memory requirements depend on the model and context length. If a model does not fit on one GPU, use multiple visible GPUs and set `--tensor-parallel-size` accordingly. `--gpu-memory-utilization` controls the vLLM allocation fraction and defaults to `0.85`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m hyper \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --dataset medqa --tensor-parallel-size 2
+```
+
+</details>
+
+### 4. Inspect the results
+
+The terminal reports accuracy and the saved result path. Each JSON file contains the run configuration, aggregate results, and per-question hypotheses, queries, retrieved evidence, and answers.
 
 ```text
-outputs/results/<provider>/<model>/...
+outputs/<model>/medqa_hyper_<timestamp>.json
 ```
 
-예시:
-- OpenAI: `outputs/results/openai/gpt-4o-mini/...`
-- Local(vLLM): `outputs/results/local/Qwen_Qwen3-4B-Instruct-2507/...`
+Use `--output path/to/results` to choose a directory. Inspect settings without loading models with `python -m hyper --dry-run`, or list options with `python -m hyper --help`.
 
-`--output-dir`를 지정하면 해당 경로를 우선 사용합니다.
+## How it works
 
-## 4. Evaluate 사용법
+| Stage | Input | Output |
+| --- | --- | --- |
+| **Hypothesis** | Question and answer options | A provisional answer and evidence needs |
+| **Query** | Question and hypothesis plan | Support, Distinction, and Feature queries |
+| **Retrieve** | Three queries | Top-5 passages per query, fused into at most 15 passages |
+| **Answer** | Question, answer options, and retrieved passages | The final answer |
 
-### 4.0 Prompt 로딩 규칙 (`load_mirage_prompts`)
+Duplicate passages are merged and ranked by the sum of their retrieval scores. The final answer prompt receives the evidence context without the hypothesis plan. The three prompts are defined in [`hyper/prompts.py`](hyper/prompts.py).
 
-- 기본 프롬프트 레지스트리는 `core/prompts.py`입니다.
-- 실행 시 `MIRAGE/MedRAG/src/template.py`가 있으면 `load_mirage_prompts()`가 MIRAGE 원본 시스템 프롬프트(`general_medrag_system`, `general_cot_system`)를 읽어와 덮어씁니다.
-- Direct rewriting용 query prompt는 `core/prompts.py`의 `DIRECT_REWRITING_PROMPT`입니다.
-- Direct rewriting의 system prompt는 `DIRECT_REWRITING_SYSTEM_PROMPT=""`(빈 문자열)이며, `DIRECT_REWRITING_TARGET_QUERIES=3`, `DIRECT_REWRITING_DOCS_PER_QUERY=5`(총 15)로 고정됩니다.
-- 목적: 로컬 복사본과 MIRAGE 원본 간 프롬프트 drift를 방지하고, CoT/Generator baseline을 MIRAGE와 동일하게 유지하기 위함입니다.
+Generation is batched by stage, with each generation stage running in a separate worker process. The paper settings use an **8,192-token context limit**, a **2,048-token output limit**, and **greedy decoding**. MedCPT retrieves from the Textbooks corpus. Runtime and exact outputs can vary with hardware and model, index, and library revisions.
 
-### 4.1 단일 평가 (`evaluate.py`)
+## Repository guide
 
-OpenAI + Hypothesis 모드:
-
-```bash
-python scripts/evaluate/evaluate.py \
-  --mode hypothesis \
-  --llm-provider openai \
-  --model gpt-4o-mini \
-  --hypothesis-prompt v7 \
-  --rewriting-prompt v10 \
-  --generator-prompt v1 \
-  --max-questions 1273
+```text
+hyper/
+  __main__.py      Command-line entry point
+  pipeline.py      Hypothesis → query → retrieval → answer
+  prompts.py       The three HYPER prompts
+  parsing.py       Model-output parsing
+  inference.py     Batched generation workers
+  retrieval.py     MedRAG interface
+scripts/
+  prepare_data.py  Verified benchmark download
+MIRAGE/MedRAG/     Upstream retrieval utilities
+assets/           Paper illustration
 ```
 
-Local(vLLM) + Hypothesis 모드:
+## Data and attribution
 
-```bash
-python scripts/evaluate/evaluate.py \
-  --mode hypothesis \
-  --llm-provider vllm \
-  --model Qwen/Qwen3-4B-Instruct-2507 \
-  --hypothesis-prompt v7 \
-  --rewriting-prompt v10 \
-  --generator-prompt v1 \
-  --vllm-tensor-parallel-size 1 \
-  --vllm-gpu-memory-utilization 0.9 \
-  --vllm-max-model-len 8192 \
-  --vllm-max-tokens 2048 \
-  --max-questions 1273
+HYPER builds on [MIRAGE](https://github.com/gzxiong/MIRAGE), [MedRAG](https://github.com/gzxiong/MedRAG), and [MedCPT](https://huggingface.co/ncbi/MedCPT-Query-Encoder). Original notices are retained; source attribution and resource terms are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Benchmark questions, corpus text, model weights, and generated logs are obtained or created locally and excluded from the repository. Review the original resource terms before use or redistribution. This code supports benchmark research; it is not a clinical decision system.
+
+## Citation
+
+```bibtex
+@misc{chang2027hyper,
+  title  = {{HYPER}: Hypothesis-Guided Planning for Evidence-Seeking Retrieval},
+  author = {Chang, Hangeol and Lee, Changsun and Rho, Seungjoon and Yeo, Junho and Ye, Jong Chul},
+  year   = {2027},
+  note   = {Accepted to EACL 2027},
+  url    = {https://github.com/hangeol/HypothesisRAG}
+}
 ```
-
-체크포인트 override (예: hypothesis/rewriter만 교체):
-
-```bash
-python scripts/evaluate/evaluate.py \
-  --mode hypothesis \
-  --llm-provider vllm \
-  --model Qwen/Qwen3-4B-Instruct-2507 \
-  --hypothesis-checkpoint /path/to/hyp/checkpoint-1400 \
-  --rewriter-checkpoint /path/to/rew/checkpoint-1300 \
-  --hypothesis-prompt v7 --rewriting-prompt v10 --generator-prompt v1
-```
-
-Baseline 모드:
-
-```bash
-python scripts/evaluate/evaluate.py --mode cot --llm-provider openai --model gpt-4o-mini
-python scripts/evaluate/evaluate.py --mode directrag --llm-provider vllm --model Qwen/Qwen3-4B-Instruct-2507
-python scripts/evaluate/evaluate.py --mode directrewriting --llm-provider vllm --model Qwen/Qwen3-4B-Instruct-2507
-```
-
-### 4.2 체크포인트 스윕 (`evaluate_checkpoints.py`)
-
-```bash
-python scripts/evaluate/evaluate_checkpoints.py \
-  outputs/hypothesis_grpo/20260228_172844 \
-  --mode hypothesis \
-  --gpus 0,2 \
-  --max-questions 1273 \
-  --total-docs 15 \
-  --gpu-mem 0.35 \
-  --max-model-len 8192 \
-  --max-tokens 2048 \
-  --vllm-tensor-parallel-size 1 \
-  --hypothesis-prompt v7 --rewriting-prompt v10 --generator-prompt v1
-```
-
-### 4.3 Prompt/Model Ablation (`evaluate.py` 단일 진입점)
-
-```bash
-python scripts/evaluate/evaluate.py \
-  --mode hypothesis \
-  --llm-provider openai \
-  --ablation-models gpt-4o-mini gpt-4o \
-  --ablation-combos v5-v5-v2 v7-v10-v2 \
-  --max-questions 1273 \
-  --max-concurrent 120
-```
-
-## 5. Train 사용법
-
-메인 래퍼: `scripts/train/run_training.sh`  
-(스크립트가 프로젝트 루트로 자동 이동하므로 어느 경로에서 실행해도 됩니다.)
-
-### 5.1 Rewriter 학습
-
-```bash
-bash scripts/train/run_training.sh \
-  --mode rewriter \
-  --gpus 0,1,2 \
-  --num_vllm_gpus 1 \
-  --num_train_gpus 2 \
-  --base_model Qwen/Qwen3-4B-Instruct-2507 \
-  --per_device_bs 1 \
-  --total_batch_size 32 \
-  --group_size 8 \
-  --hypothesis_prompt v7 --rewriting_prompt v10 --generator_prompt v1
-```
-
-### 5.2 Hypothesis 학습
-
-```bash
-bash scripts/train/run_training.sh \
-  --mode hypothesis \
-  --gpus 0,1,2 \
-  --num_vllm_gpus 1 \
-  --num_train_gpus 2 \
-  --base_model Qwen/Qwen3-4B-Instruct-2507 \
-  --per_device_bs 1 \
-  --total_batch_size 32 \
-  --group_size 8 \
-  --hypothesis_prompt v7 --rewriting_prompt v10 --generator_prompt v1
-```
-
-학습 진입점 직접 실행:
-- `training/train_hypothesis_grpo.py`
-- `training/train_rewriter_grpo.py`
-
-## 6. Analysis 사용법
-
-```bash
-python scripts/analysis/eval_grpo.py --help
-python scripts/analysis/analyze_failure_modes.py --help
-python scripts/analysis/analyze_best_guess_vs_gold.py --help
-python scripts/analysis/compare_v4_v5_results.py
-python scripts/analysis/prune_checkpoints_for_inference.py --help
-```
-
-## 7. Past 코드
-
-사용하지 않는 과거 코드는 `scripts/past/`로 분리했습니다.
-
-- `scripts/past/evaluate_past.py` (기존 `evaluate_medqa.py`)
-- `scripts/past/run_gpt_ablation.py`
-- `scripts/past/run_ablation_gpu*.sh`
-- `scripts/past/run_rag.py`, `scripts/past/test_rag.py`
-- `scripts/past/etc/*`
-
-## 8. 외부 자료 및 라이선스
-
-포함된 외부 코드와 데이터의 출처 및 이용 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 정리했습니다. 각 자료에는 원래의 라이선스가 적용됩니다. 검색 문서 원문과 이를 포함한 전체 프롬프트는 로컬 결과 폴더에 보관하고, 공개 로그에는 해당 자료의 배포 조건을 확인한 뒤 포함해 주세요.
