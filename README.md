@@ -232,3 +232,7 @@ python scripts/analysis/prune_checkpoints_for_inference.py --help
 - `scripts/past/run_ablation_gpu*.sh`
 - `scripts/past/run_rag.py`, `scripts/past/test_rag.py`
 - `scripts/past/etc/*`
+
+## 8. 외부 자료 및 라이선스
+
+포함된 외부 코드와 데이터의 출처 및 이용 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 정리했습니다. 각 자료에는 원래의 라이선스가 적용됩니다. 검색 문서 원문과 이를 포함한 전체 프롬프트는 로컬 결과 폴더에 보관하고, 공개 로그에는 해당 자료의 배포 조건을 확인한 뒤 포함해 주세요.

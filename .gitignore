@@ -9,3 +9,6 @@ MIRAGE/results/*
 outputs/*
 *.log
 trainlog.txt
+
+# Local MedGemma outputs may contain retrieved corpus text and full prompts.
+/MIRAGE/medgemma_medqa_rag_results_*.json
