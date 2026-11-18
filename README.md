@@ -5,7 +5,7 @@
 
 **Hangeol Chang · Changsun Lee · Seungjoon Rho · Junho Yeo · Jong Chul Ye**
 
-**EACL 2027**
+**Findings of EACL 2027**
 
 [Preprint](https://arxiv.org/abs/2603.19008) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Citation](#citation)
 
@@ -145,7 +145,7 @@ Benchmark questions, corpus text, model weights, and generated logs are obtained
   title  = {{HYPER}: Hypothesis-Guided Planning for Evidence-Seeking Retrieval},
   author = {Chang, Hangeol and Lee, Changsun and Rho, Seungjoon and Yeo, Junho and Ye, Jong Chul},
   year   = {2027},
-  note   = {Accepted to EACL 2027},
+  note   = {Accepted to Findings of EACL 2027},
   url    = {https://github.com/hangeol/HypothesisRAG}
 }
 ```
